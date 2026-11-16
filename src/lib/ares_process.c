@@ -649,7 +649,7 @@ typedef enum {
 typedef struct {
   requeue_type_t     type;   /* type of entry, requeue or endquery */
   unsigned short     qid;    /* query id */
-  size_t             serial; /* identifies the query the qid meant when
+  ares_uint64_t      serial; /* identifies the query the qid meant when
                               * this entry was appended */
   ares_server_t     *server; /* requeue only: optional */
   ares_status_t      status; /* endquery only */
@@ -706,7 +706,7 @@ static ares_status_t ares_append_endqueue(ares_array_t     **requeue,
  *  address the freed one had.  The serial is a channel-wide counter that is
  *  never reused. */
 static ares_bool_t ares_query_is_live(const ares_channel_t *channel,
-                                      unsigned short qid, size_t serial)
+                                      unsigned short qid, ares_uint64_t serial)
 {
   const ares_query_t *query =
     ares_htable_szvp_get_direct(channel->queries_by_qid, qid);
@@ -1542,7 +1542,7 @@ static ares_status_t ares_conn_query_write(ares_conn_t          *conn,
 
   /* We write using the TCP format even for UDP, we just strip the length
    * before putting on the wire */
-  status = ares_dns_write_buf_tcp(query->query, conn->out_buf);
+  status = ares_conn_enqueue_nolock(conn, query);
   if (status != ARES_SUCCESS) {
     return status;
   }
@@ -1587,7 +1587,7 @@ ares_status_t ares_send_query(ares_server_t *requested_server,
   ares_channel_t *channel = query->channel;
   ares_array_t   *requeue = NULL;
   unsigned short  qid     = query->qid;
-  size_t          serial  = query->serial;
+  ares_uint64_t   serial  = query->serial;
   ares_status_t   status;
 
   status = ares_send_query_int(requested_server, query, now, &requeue);
@@ -1624,7 +1624,7 @@ static ares_status_t ares_send_query_int(ares_server_t        *requested_server,
   ares_bool_t     probe_downed_server = ARES_TRUE;
   /* Captured before any application callback below, which may free the query */
   unsigned short  qid    = query->qid;
-  size_t          serial = query->serial;
+  ares_uint64_t   serial = query->serial;
 
   /* Choose the server to send the query to */
   if (requested_server != NULL) {
@@ -1862,6 +1862,7 @@ done:
 
 void ares_detach_query(ares_query_t *query)
 {
+  ares_conn_discard_query_nolock(query->channel, query->serial);
   /* Remove the query from all the lists in which it is linked */
   ares_query_remove_from_conn(query);
   /* Only release the qid slot if it is still ours.  A query detached before

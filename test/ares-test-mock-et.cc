@@ -34,13 +34,150 @@
 #endif
 
 #include <sstream>
-#include <vector>
+#  include <condition_variable>
+#  include <vector>
 
 using testing::InvokeWithoutArgs;
 using testing::DoAll;
 
 namespace ares {
 namespace test {
+
+struct OperationThreadResult {
+  std::mutex              mutex;
+  std::condition_variable condition;
+  bool                    entered  = false;
+  bool                    released = false;
+  size_t                  calls    = 0;
+  ares_status_t           status   = ARES_SUCCESS;
+};
+
+static void OperationThreadCallback(void *arg, ares_status_t status, size_t,
+                                    const ares_dns_record_t *)
+{
+  OperationThreadResult *result = static_cast<OperationThreadResult *>(arg);
+  std::unique_lock<std::mutex> lock(result->mutex);
+  result->calls++;
+  result->status  = status;
+  result->entered = true;
+  result->condition.notify_all();
+  EXPECT_TRUE(result->condition.wait_for(
+    lock, std::chrono::seconds(5), [result] { return result->released; }));
+}
+
+TEST_P(MockUDPEventThreadTest,
+       IndividualCancellationCompletionOwnsCallbackLifetime)
+{
+  DNSPacket reply;
+  reply.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("thread.example", T_A))
+    .add_answer(new DNSARR("thread.example", 100, { 1, 2, 3, 4 }));
+  EXPECT_CALL(server_, OnRequest("thread.example", T_A))
+    .WillOnce(SetReply(&server_, &reply));
+  OperationThreadResult result;
+  ares_operation_t     *op = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel_, "thread.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationThreadCallback, &result, &op));
+  std::thread cancel([&] {
+    std::unique_lock<std::mutex> lock(result.mutex);
+    bool entered = result.condition.wait_for(lock, std::chrono::seconds(5),
+                                             [&] { return result.entered; });
+    EXPECT_TRUE(entered);
+    lock.unlock();
+    // Completion selected its outcome before callback entry. Cancellation can
+    // return and the caller can release its token while the callback is held.
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, op));
+    ares_operation_release(op);
+    lock.lock();
+    result.released = true;
+    result.condition.notify_all();
+  });
+  Process();
+  cancel.join();
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_EQ(ARES_SUCCESS, result.status);
+}
+
+TEST_P(MockUDPEventThreadTest,
+       IndividualCancellationDestroyOwnsCallbackLifetime)
+{
+  OperationThreadResult result;
+  ares_operation_t     *op = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel_, "pending.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationThreadCallback, &result, &op));
+  std::thread cancel([&] {
+    std::unique_lock<std::mutex> lock(result.mutex);
+    EXPECT_TRUE(result.condition.wait_for(lock, std::chrono::seconds(5),
+                                          [&] { return result.entered; }));
+    lock.unlock();
+    // Destroy has selected terminality. The terminal fast path must not lock
+    // or dereference a channel that is being destroyed on the other thread.
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, op));
+    ares_operation_release(op);
+    lock.lock();
+    result.released = true;
+    result.condition.notify_all();
+  });
+  ares_destroy(channel_);
+  channel_ = nullptr;
+  cancel.join();
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_EQ(ARES_EDESTRUCTION, result.status);
+}
+
+static void OperationRaceCallback(void *arg, ares_status_t status, size_t,
+                                  const ares_dns_record_t *)
+{
+  OperationThreadResult *result = static_cast<OperationThreadResult *>(arg);
+  result->calls++;
+  result->status = status;
+}
+
+TEST_P(MockUDPEventThreadTest, IndividualCancellationRacesResponseDelivery)
+{
+  DNSPacket reply;
+  reply.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("race.example", T_A))
+    .add_answer(new DNSARR("race.example", 100, { 1, 2, 3, 4 }));
+  std::mutex              mutex;
+  std::condition_variable condition;
+  bool                    ready = false;
+  EXPECT_CALL(server_, OnRequest("race.example", T_A))
+    .WillOnce(testing::Invoke([&](const std::string &, int) {
+      server_.SetReply(&reply);
+      std::lock_guard<std::mutex> lock(mutex);
+      ready = true;
+      condition.notify_all();
+    }));
+  OperationThreadResult result;
+  ares_operation_t     *op = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel_, "race.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationRaceCallback, &result, &op));
+  std::thread cancel([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(
+      condition.wait_for(lock, std::chrono::seconds(5), [&] { return ready; }));
+    lock.unlock();
+    // The event thread may process the response concurrently with cancellation.
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, op));
+  });
+  Process();
+  cancel.join();
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_TRUE(result.status == ARES_SUCCESS ||
+              result.status == ARES_ECANCELLED);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, op));
+  EXPECT_EQ(1U, result.calls);
+  ares_operation_release(op);
+}
 
 // UDP only so mock server doesn't get confused by concatenated requests
 TEST_P(MockUDPEventThreadTest, GetHostByNameParallelLookups) {

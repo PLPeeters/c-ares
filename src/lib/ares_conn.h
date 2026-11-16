@@ -28,6 +28,7 @@
 
 #include "ares_socket.h"
 
+struct ares_query;
 struct ares_conn;
 typedef struct ares_conn ares_conn_t;
 
@@ -79,6 +80,10 @@ struct ares_conn {
    *  wire-format message).  For TCP this can be sent as-is, UDP this must
    *  be sent per-packet (stripping the length prefix) */
   ares_buf_t             *out_buf;
+  /*! FIFO frame ownership/progress. No frame references query memory. */
+  ares_llist_t           *out_frames;
+  /*! Defer frame pruning until the active socket write reports its progress. */
+  ares_bool_t             out_write_active;
 
   /*! Inbound buffered data that is not yet parsed.  Exists as one contiguous
    *  stream in TCP format (big endian 16bit length prefix followed by DNS
@@ -196,6 +201,21 @@ ares_status_t ares_open_connection(ares_conn_t   **conn_out,
 
 ares_conn_err_t ares_conn_write(ares_conn_t *conn, const void *data, size_t len,
                                 size_t *written);
+/*! Serialize and enqueue a frame with its query lifetime identity.
+ *  \param[in] conn Connection.
+ *  \param[in] query Query to serialize.
+ *  \return Serialization status or ARES_ENOMEM.
+ */
+ares_status_t ares_conn_enqueue_nolock(ares_conn_t             *conn,
+                                       const struct ares_query *query);
+
+/*! Discard wholly unsent frames of a terminal query on every live connection.
+ *  \param[in] channel Channel with lock held.
+ *  \param[in] serial Query lifetime identity (not the wire ID).
+ */
+void ares_conn_discard_query_nolock(ares_channel_t *channel,
+                                    ares_uint64_t   serial);
+
 ares_status_t ares_conn_flush(ares_conn_t *conn);
 ares_conn_err_t ares_conn_read(ares_conn_t *conn, void *data, size_t len,
                                size_t *read_bytes);

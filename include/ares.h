@@ -827,6 +827,54 @@ CARES_EXTERN ares_status_t ares_set_socket_functions_ex(
   void *user_data);
 
 
+/*! Opaque retained identity for a cancellable logical operation. */
+typedef struct ares_operation ares_operation_t;
+
+/*! Cancel an operation. Terminal operations are a successful no-op.
+ *  \param[in] channel Live submitting channel for an active operation.
+ *  \param[in] operation Retained operation token.
+ *  \return ARES_SUCCESS, or ARES_EFORMERR for an invalid association.
+ */
+CARES_EXTERN ares_status_t ares_operation_cancel(ares_channel_t   *channel,
+                                                 ares_operation_t *operation);
+
+/*! Retain a token, independently of channel lifetime.
+ *  \param[in] operation Retained operation token.
+ */
+CARES_EXTERN void ares_operation_retain(ares_operation_t *operation);
+
+/*! Release a token. Does not cancel active work.
+ *  \param[in] operation Retained operation token, or NULL.
+ */
+CARES_EXTERN void ares_operation_release(ares_operation_t *operation);
+
+/*! Submit a cancellable raw DNS message. See ares_operation(3).
+ *  \param[in] channel Live channel.
+ *  \param[in] dnsrec DNS message to duplicate and send.
+ *  \param[in] callback Exactly one terminal callback after acceptance.
+ *  \param[in] arg Callback argument.
+ *  \param[out] operation Receives one reference before callback eligibility.
+ *  \return ARES_SUCCESS on acceptance; otherwise no callback or token.
+ */
+CARES_EXTERN ares_status_t ares_send_dnsrec_cancellable(
+  ares_channel_t *channel, const ares_dns_record_t *dnsrec,
+  ares_callback_dnsrec callback, void *arg, ares_operation_t **operation);
+
+/*! Submit a cancellable DNS query. See ares_operation(3).
+ *  \param[in] channel Live channel.
+ *  \param[in] name Query name.
+ *  \param[in] dnsclass DNS class.
+ *  \param[in] type DNS record type.
+ *  \param[in] callback Exactly one terminal callback after acceptance.
+ *  \param[in] arg Callback argument.
+ *  \param[out] operation Receives one reference before callback eligibility.
+ *  \return ARES_SUCCESS on acceptance; otherwise no callback or token.
+ */
+CARES_EXTERN ares_status_t ares_query_dnsrec_cancellable(
+  ares_channel_t *channel, const char *name, ares_dns_class_t dnsclass,
+  ares_dns_rec_type_t type, ares_callback_dnsrec callback, void *arg,
+  ares_operation_t **operation);
+
 CARES_EXTERN CARES_DEPRECATED_FOR(ares_send_dnsrec) void ares_send(
   ares_channel_t *channel, const unsigned char *qbuf, int qlen,
   ares_callback callback, void *arg);

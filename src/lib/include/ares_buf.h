@@ -172,6 +172,17 @@ CARES_EXTERN ares_status_t ares_buf_append_num_hex(ares_buf_t *buf, size_t num,
 CARES_EXTERN ares_status_t ares_buf_set_length(ares_buf_t *buf, size_t len);
 
 
+/*! Remove a range from unread data in a mutable buffer, without allocation.
+ *  Positions after the removed range shift left; a tag within it moves to
+ *  its beginning. The current read position is unchanged.
+ *  \param[in] buf Mutable buffer.
+ *  \param[in] offset Range start relative to current read position.
+ *  \param[in] len Number of bytes to remove, possibly zero.
+ *  \return ARES_SUCCESS, or ARES_EFORMERR for an invalid range/const buffer.
+ */
+CARES_EXTERN ares_status_t ares_buf_remove(ares_buf_t *buf, size_t offset,
+                                           size_t len);
+
 /*! Start a dynamic append operation that returns a buffer suitable for
  *  writing.  A desired minimum length is passed in, and the actual allocated
  *  buffer size is returned which may be greater than the requested size.

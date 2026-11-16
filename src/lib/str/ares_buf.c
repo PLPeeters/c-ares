@@ -221,6 +221,35 @@ ares_status_t ares_buf_set_length(ares_buf_t *buf, size_t len)
   return ARES_SUCCESS;
 }
 
+ares_status_t ares_buf_remove(ares_buf_t *buf, size_t offset, size_t len)
+{
+  size_t start;
+  size_t available;
+
+  if (buf == NULL || ares_buf_is_const(buf)) {
+    return ARES_EFORMERR;
+  }
+  available = ares_buf_len(buf);
+  if (offset > available || len > available - offset) {
+    return ARES_EFORMERR;
+  }
+  if (len == 0) {
+    return ARES_SUCCESS;
+  }
+  start = buf->offset + offset;
+  memmove(buf->alloc_buf + start, buf->alloc_buf + start + len,
+          buf->data_len - start - len);
+  buf->data_len -= len;
+  if (buf->tag_offset != SIZE_MAX && buf->tag_offset > start) {
+    if (buf->tag_offset < start + len) {
+      buf->tag_offset = start;
+    } else {
+      buf->tag_offset -= len;
+    }
+  }
+  return ARES_SUCCESS;
+}
+
 ares_status_t ares_buf_append(ares_buf_t *buf, const unsigned char *data,
                               size_t data_len)
 {

@@ -1,0 +1,127 @@
+.\" Copyright (C) 2026 The c-ares project and its contributors
+.\" SPDX-License-Identifier: MIT
+.\"
+.TH ARES_OPERATION 3 "16 November 2026"
+.SH NAME
+ares_operation_t, ares_query_dnsrec_cancellable, ares_send_dnsrec_cancellable,
+ares_operation_cancel, ares_operation_retain, ares_operation_release \-
+submit and individually cancel retained DNS operations
+.SH SYNOPSIS
+.nf
+#include <ares.h>
+
+ typedef struct ares_operation ares_operation_t;
+
+ ares_status_t ares_query_dnsrec_cancellable(
+   ares_channel_t *channel, const char *name, ares_dns_class_t dnsclass,
+   ares_dns_rec_type_t type, ares_callback_dnsrec callback, void *arg,
+   ares_operation_t **operation);
+
+ ares_status_t ares_send_dnsrec_cancellable(
+   ares_channel_t *channel, const ares_dns_record_t *dnsrec,
+   ares_callback_dnsrec callback, void *arg, ares_operation_t **operation);
+
+ ares_status_t ares_operation_cancel(ares_channel_t *channel,
+                                     ares_operation_t *operation);
+ void ares_operation_retain(ares_operation_t *operation);
+ void ares_operation_release(ares_operation_t *operation);
+.fi
+.SH DESCRIPTION
+These submissions perform the same raw DNS work and response conversion as
+.BR ares_query_dnsrec (3)
+and
+.BR ares_send_dnsrec (3),
+respectively, and return an opaque operation token. Existing submission APIs
+are unchanged. This token is a logical operation identity, not a DNS wire ID.
+Search and address-lookup operations are not provided by these functions.
+.PP
+On acceptance the function returns
+.BR ARES_SUCCESS ,
+publishes one caller-owned reference in
+.IR *operation ,
+and invokes exactly one terminal callback, including on synchronous errors or
+cache hits. Publication precedes callback eligibility: the callback can read
+the output token and reenter cancellation or retain/release. The callback may
+run before submission returns. A non-success return means no acceptance, no
+callback, and a NULL output token. The output pointer, channel, callback, and
+query input must be non-NULL. The raw DNS record is duplicated; it need not
+remain alive after submission returns. Response records remain borrowed for
+the duration of the callback, as with the existing APIs.
+.PP
+.B ares_operation_cancel
+cancels only the supplied operation. If cancellation wins terminal selection,
+the callback receives
+.BR ARES_ECANCELLED .
+Cancellation removes timeout/retry work and wholly unsent owned output frames,
+including frames left on earlier connections by a retry. Unrelated operations
+on the channel continue normally. A TCP frame that has already been partially
+written may finish to preserve framing on a shared connection. Its residual
+bytes do not refer to the cancelled query or callback state. Bytes already
+handed to a socket write cannot be retracted; if cancellation reenters from
+that write, its reported progress determines which residual bytes remain.
+The remote server may still process such a request.
+.PP
+Cancellation and completion are serialized by the channel lock. A terminal
+token, including one whose callback is still executing on another thread,
+is a successful no-op on repeated cancellation. Cancellation does not wait
+for an already selected callback to return. Callback arguments must remain
+valid through callback return. No operation can be notified twice or revived
+by a stale retained token, even if its former wire ID is reused.
+.PP
+Response matching retains the existing wire ID, question, and connection
+checks. A delayed response for a cancelled operation may satisfy an identical
+replacement operation after the same wire ID is reused on the same connection.
+Cancellation adds no wire-ID quarantine or connection rotation.
+.PP
+The library holds an active token reference through terminal callback return.
+.B ares_operation_release
+only releases a reference; it never cancels active work. Tokens may be retained
+and released independently of channel lifetime. After channel destruction,
+retained terminal tokens can be retained, released, or cancelled (with a NULL
+channel) without accessing the destroyed channel. Do not use a released token.
+The library must remain initialized while tokens exist.
+.PP
+An active cancellation requires the submitting live channel. Passing a different
+channel returns
+.B ARES_EFORMERR
+without affecting either channel. As with other channel APIs, the caller must
+ensure an active channel call does not overlap destruction of that channel;
+the channel lock does not keep a destroyed channel pointer alive. Channel
+shutdown delivers
+.B ARES_EDESTRUCTION
+if destruction wins, or
+.B ARES_ECANCELLED
+if cancellation wins first. Submission to a channel already shutting down is
+rejected before acceptance.
+.PP
+These functions are thread safe when c-ares is built with thread safety.
+Without thread safety, callers must serialize operation reference changes and
+channel calls themselves.
+.SH RETURN VALUES
+Submission returns
+.B ARES_SUCCESS
+on acceptance,
+.B ARES_ENOMEM
+if the token cannot be allocated,
+.B ARES_EFORMERR
+for missing arguments, or
+.B ARES_EDESTRUCTION
+if the channel is shutting down. Errors after acceptance are delivered only
+through the callback.
+The channel's finite 64-bit frame-identity space is never reused. If exhausted,
+new wire queries fail with
+.BR ARES_ENOMEM ;
+existing queries and retained tokens remain valid.
+.PP
+Cancellation returns
+.B ARES_SUCCESS
+for active cancellation or a terminal no-op, or
+.B ARES_EFORMERR
+for a NULL token or an invalid active channel association. Retain/release
+accept NULL as a no-op.
+.SH SEE ALSO
+.BR ares_query_dnsrec (3),
+.BR ares_send_dnsrec (3),
+.BR ares_cancel (3),
+.BR ares_destroy (3),
+.BR ares_threadsafety (3)

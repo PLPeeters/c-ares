@@ -37,6 +37,7 @@
 #endif
 
 #include <sstream>
+#include <thread>
 #include <vector>
 
 using testing::InvokeWithoutArgs;
@@ -2136,6 +2137,830 @@ TEST_P(MockUDPChannelTest, Resend) {
   std::stringstream ss;
   ss << result.host_;
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
+}
+
+struct OperationResult {
+  size_t        calls  = 0;
+  ares_status_t status = ARES_SUCCESS;
+};
+
+static void OperationCallback(void *arg, ares_status_t status, size_t,
+                              const ares_dns_record_t *)
+{
+  OperationResult *result = static_cast<OperationResult *>(arg);
+  result->calls++;
+  result->status = status;
+}
+
+TEST_P(MockChannelTest, IndividualCancellationPreservesOtherQuery)
+{
+  DNSPacket reply;
+  reply.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("other.example", T_A))
+    .add_answer(new DNSARR("other.example", 100, { 1, 2, 3, 4 }));
+  ON_CALL(server_, OnRequest("other.example", T_A))
+    .WillByDefault(SetReply(&server_, &reply));
+  OperationResult   cancelled, other;
+  ares_operation_t *first  = nullptr;
+  ares_operation_t *second = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel_, "cancel.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &cancelled, &first));
+  ares_dns_record_t *record = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_dns_record_create(&record, 0, ARES_FLAG_RD, ARES_OPCODE_QUERY,
+                                   ARES_RCODE_NOERROR));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_dns_record_query_add(record, "other.example", ARES_REC_TYPE_A,
+                                      ARES_CLASS_IN));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_send_dnsrec_cancellable(channel_, record, OperationCallback,
+                                         &other, &second));
+  ares_dns_record_destroy(record);
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, first));
+  EXPECT_EQ(1U, cancelled.calls);
+  EXPECT_EQ(ARES_ECANCELLED, cancelled.status);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, first));
+  Process();
+  EXPECT_EQ(1U, cancelled.calls);
+  EXPECT_EQ(1U, other.calls);
+  EXPECT_EQ(ARES_SUCCESS, other.status);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, first));
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, second));
+  ares_operation_release(first);
+  ares_operation_release(second);
+}
+
+struct OperationWrites {
+  ares_socket_functions      funcs = {};
+  std::vector<unsigned char> bytes;
+  std::vector<unsigned char> incoming;
+  size_t                     limit              = static_cast<size_t>(-1);
+  bool                       blocked            = false;
+  bool                       cancel_before_copy = false;
+  ares_channel_t            *channel            = nullptr;
+  ares_operation_t          *cancel_on_write    = nullptr;
+};
+
+static int OperationConnect(ares_socket_t, const struct sockaddr *,
+                            ares_socklen_t, void *)
+{
+  return 0;
+}
+
+static ares_ssize_t OperationSend(ares_socket_t, const struct iovec *iov,
+                                  int iovcnt, void *arg)
+{
+  OperationWrites *writes = static_cast<OperationWrites *>(arg);
+  if (writes->blocked) {
+#ifdef USE_WINSOCK
+    WSASetLastError(WSAEWOULDBLOCK);
+#else
+    errno = EWOULDBLOCK;
+#endif
+    return -1;
+  }
+  if (writes->cancel_before_copy && writes->cancel_on_write != nullptr) {
+    ares_operation_t *op    = writes->cancel_on_write;
+    writes->cancel_on_write = nullptr;
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(writes->channel, op));
+  }
+  size_t remaining = writes->limit;
+  size_t written   = 0;
+  for (int i = 0; i < iovcnt && remaining; i++) {
+    size_t               count = std::min(remaining, iov[i].iov_len);
+    const unsigned char *data =
+      static_cast<const unsigned char *>(iov[i].iov_base);
+    writes->bytes.insert(writes->bytes.end(), data, data + count);
+    remaining -= count;
+    written   += count;
+  }
+  if (writes->cancel_on_write != nullptr) {
+    ares_operation_t *op    = writes->cancel_on_write;
+    writes->cancel_on_write = nullptr;
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(writes->channel, op));
+  }
+  return static_cast<ares_ssize_t>(written);
+}
+
+static ares_ssize_t OperationReceive(ares_socket_t, void *buffer, size_t len,
+                                     int, struct sockaddr *, ares_socklen_t *,
+                                     void *arg)
+{
+  OperationWrites *writes = static_cast<OperationWrites *>(arg);
+  if (writes->incoming.empty()) {
+#ifdef USE_WINSOCK
+    WSASetLastError(WSAEWOULDBLOCK);
+#else
+    errno = EWOULDBLOCK;
+#endif
+    return -1;
+  }
+  size_t count = std::min(len, writes->incoming.size());
+  memcpy(buffer, writes->incoming.data(), count);
+  writes->incoming.erase(writes->incoming.begin(),
+                         writes->incoming.begin() + count);
+  return static_cast<ares_ssize_t>(count);
+}
+
+static void OperationQueueResponse(OperationWrites *writes, const char *name,
+                                   unsigned short id)
+{
+  DNSPacket reply;
+  reply.set_response()
+    .set_aa()
+    .set_qid(id)
+    .add_question(new DNSQuestion(name, T_A))
+    .add_answer(new DNSARR(name, 100, { 1, 2, 3, 4 }));
+  std::vector<byte> data = reply.data();
+  writes->incoming.push_back(static_cast<unsigned char>(data.size() / 256));
+  writes->incoming.push_back(static_cast<unsigned char>(data.size() % 256));
+  writes->incoming.insert(writes->incoming.end(), data.begin(), data.end());
+}
+
+static ares_channel_t *OperationChannel(OperationWrites *writes,
+                                        bool             tcp = true)
+{
+  ares_channel_t *channel = nullptr;
+  ares_options    opts;
+  memset(&opts, 0, sizeof(opts));
+  opts.flags   = ARES_FLAG_STAYOPEN | (tcp ? ARES_FLAG_USEVC : 0);
+  opts.timeout = 100;
+  opts.tries   = 3;
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_init_options(&channel, &opts,
+                              ARES_OPT_FLAGS | ARES_OPT_TIMEOUTMS |
+                                ARES_OPT_TRIES | ARES_OPT_QUERY_CACHE));
+  if (!channel) {
+    return nullptr;
+  }
+  EXPECT_EQ(ARES_SUCCESS, ares_set_servers_csv(channel, "127.0.0.1:53055"));
+  writes->funcs.aconnect  = OperationConnect;
+  writes->funcs.asendv    = OperationSend;
+  writes->funcs.arecvfrom = OperationReceive;
+  ares_set_socket_functions(channel, &writes->funcs, writes);
+  writes->channel = channel;
+  return channel;
+}
+
+static std::vector<std::string>
+  OperationWrittenNames(const OperationWrites &writes)
+{
+  std::vector<std::string> names;
+  size_t                   offset = 0;
+  while (offset + 2 <= writes.bytes.size()) {
+    size_t len  = static_cast<size_t>(writes.bytes[offset]) * 256 +
+                  writes.bytes[offset + 1];
+    offset     += 2;
+    if (len > writes.bytes.size() - offset) {
+      ADD_FAILURE() << "Incomplete TCP frame";
+      break;
+    }
+    ares_dns_record_t *record = nullptr;
+    EXPECT_EQ(ARES_SUCCESS,
+              ares_dns_parse(writes.bytes.data() + offset, len, 0, &record));
+    const char *name = nullptr;
+    if (record) {
+      EXPECT_EQ(ARES_SUCCESS,
+                ares_dns_record_query_get(record, 0, &name, nullptr, nullptr));
+      names.push_back(name);
+    }
+    ares_dns_record_destroy(record);
+    offset += len;
+  }
+  EXPECT_EQ(writes.bytes.size(), offset);
+  return names;
+}
+
+TEST_F(LibraryTest, IndividualCancellationDiscardsUnsentTCPFrame)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  OperationResult   cancelled, other;
+  ares_operation_t *first = nullptr, *second = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "cancel.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &cancelled, &first));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "other.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &other, &second));
+  EXPECT_TRUE(writes.bytes.empty());
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, first));
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  int           mask = ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  ASSERT_NE(0, ARES_GETSOCK_WRITABLE(mask, 0));
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  EXPECT_EQ((std::vector<std::string>{ "other.example" }),
+            OperationWrittenNames(writes));
+  EXPECT_EQ(1U, cancelled.calls);
+  EXPECT_EQ(ARES_ECANCELLED, cancelled.status);
+  ares_destroy(channel);
+  EXPECT_EQ(1U, other.calls);
+  EXPECT_EQ(ARES_EDESTRUCTION, other.status);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, first));
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, second));
+  ares_operation_release(first);
+  ares_operation_release(second);
+}
+
+TEST_F(LibraryTest, IndividualCancellationFinishesOnlyPartialTCPFrame)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  writes.limit = 3;
+  OperationResult   partial, unsent, replacement;
+  ares_operation_t *first = nullptr, *second = nullptr, *third = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "partial.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &partial, &first));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "unsent.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &unsent, &second));
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  int           mask = ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  ASSERT_NE(0, ARES_GETSOCK_WRITABLE(mask, 0));
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  ASSERT_EQ(3U, writes.bytes.size());
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, first));
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, second));
+  ares_operation_release(
+    first);  // Residual output must not retain query state.
+  ares_operation_release(second);
+  writes.blocked = true;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "replacement.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &replacement, &third));
+  writes.blocked = false;
+  writes.limit   = static_cast<size_t>(-1);
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  EXPECT_EQ(
+    (std::vector<std::string>{ "partial.example", "replacement.example" }),
+    OperationWrittenNames(writes));
+  EXPECT_EQ(1U, partial.calls);
+  EXPECT_EQ(ARES_ECANCELLED, partial.status);
+  EXPECT_EQ(1U, unsent.calls);
+  EXPECT_EQ(ARES_ECANCELLED, unsent.status);
+  ares_destroy(channel);
+  EXPECT_EQ(1U, replacement.calls);
+  ares_operation_release(third);
+}
+
+TEST_F(LibraryTest, IndividualCancellationInsideSocketWrite)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  writes.limit = 3;
+  OperationResult   partial, other;
+  ares_operation_t *first = nullptr, *second = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "partial.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &partial, &first));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "other.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &other, &second));
+  writes.cancel_on_write = first;
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  EXPECT_EQ(1U, partial.calls);
+  EXPECT_EQ(ARES_ECANCELLED, partial.status);
+  writes.limit = static_cast<size_t>(-1);
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  EXPECT_EQ((std::vector<std::string>{ "partial.example", "other.example" }),
+            OperationWrittenNames(writes));
+  ares_destroy(channel);
+  EXPECT_EQ(1U, partial.calls);
+  EXPECT_EQ(1U, other.calls);
+  ares_operation_release(first);
+  ares_operation_release(second);
+}
+
+struct OperationReplacement {
+  ares_channel_t   *channel;
+  OperationResult   cancelled;
+  OperationResult   replacement;
+  ares_operation_t *child = nullptr;
+  std::string       name;
+};
+
+static void OperationEnqueueOnCancellation(void *arg, ares_status_t status,
+                                           size_t, const ares_dns_record_t *)
+{
+  OperationReplacement *data = static_cast<OperationReplacement *>(arg);
+  data->cancelled.calls++;
+  data->cancelled.status = status;
+  if (status == ARES_ECANCELLED) {
+    EXPECT_EQ(ARES_SUCCESS, ares_query_dnsrec_cancellable(
+                              data->channel, data->name.c_str(), ARES_CLASS_IN,
+                              ARES_REC_TYPE_A, OperationCallback,
+                              &data->replacement, &data->child));
+  }
+}
+
+TEST_F(LibraryTest, IndividualCancellationReentryPreservesBorrowedSocketBytes)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  writes.limit              = 4;
+  writes.cancel_before_copy = true;
+  OperationReplacement data;
+  data.channel = channel;
+  data.name    = std::string(60, 'a') + "." + std::string(60, 'b') + "." +
+                 std::string(60, 'c') + "." + std::string(60, 'd');
+  ares_operation_t *op = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "partial.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationEnqueueOnCancellation, &data, &op));
+  writes.cancel_on_write = op;
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  // The socket callback cancels before reading its borrowed bytes. The terminal
+  // callback submits a larger request, growing the same connection's output.
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  EXPECT_EQ(1U, data.cancelled.calls);
+  writes.limit = static_cast<size_t>(-1);
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  EXPECT_EQ((std::vector<std::string>{ "partial.example", data.name }),
+            OperationWrittenNames(writes));
+  ares_destroy(channel);
+  EXPECT_EQ(1U, data.cancelled.calls);
+  EXPECT_EQ(1U, data.replacement.calls);
+  ares_operation_release(op);
+  ares_operation_release(data.child);
+}
+
+TEST_F(LibraryTest, IndividualCancellationWriteSnapshotAllocationFailure)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  OperationResult   result;
+  ares_operation_t *operation = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "pending.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &result, &operation));
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  ares_fd_events_t event = { socks[0], ARES_FD_EVENT_WRITE };
+  SetAllocFail(1);
+  ares_status_t status =
+    ares_process_fds(channel, &event, 1, ARES_PROCESS_FLAG_SKIP_NON_FD);
+  ClearFails();
+  EXPECT_EQ(ARES_ENOMEM, status);
+  EXPECT_TRUE(writes.bytes.empty());
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, operation));
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_EQ(ARES_ECANCELLED, result.status);
+  ares_destroy(channel);
+  EXPECT_EQ(1U, result.calls);
+  ares_operation_release(operation);
+}
+
+#ifndef CARES_SYMBOL_HIDING
+TEST_F(LibraryTest, IndividualCancellationNeverReusesFrameIdentity)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  OperationResult   old, last, exhausted;
+  ares_operation_t *first = nullptr, *second = nullptr, *third = nullptr;
+  ASSERT_EQ(ARES_SUCCESS, ares_query_dnsrec_cancellable(
+                            channel, "old.example", ARES_CLASS_IN,
+                            ARES_REC_TYPE_A, OperationCallback, &old, &first));
+  ExhaustOperationSerials(channel);
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "last.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &last, &second));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "exhausted.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &exhausted, &third));
+  EXPECT_EQ(1U, exhausted.calls);
+  EXPECT_EQ(ARES_ENOMEM, exhausted.status);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, third));
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, first));
+  EXPECT_EQ(1U, old.calls);
+  EXPECT_EQ(ARES_ECANCELLED, old.status);
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  EXPECT_EQ((std::vector<std::string>{ "last.example" }),
+            OperationWrittenNames(writes));
+  ares_destroy(channel);
+  EXPECT_EQ(1U, old.calls);
+  EXPECT_EQ(1U, last.calls);
+  EXPECT_EQ(ARES_EDESTRUCTION, last.status);
+  EXPECT_EQ(1U, exhausted.calls);
+  ares_operation_release(first);
+  ares_operation_release(second);
+  ares_operation_release(third);
+}
+#endif
+
+struct OperationReentry {
+  ares_channel_t   *channel;
+  ares_operation_t *operation = nullptr;
+  OperationResult   result;
+  bool              published = false;
+};
+
+static void OperationReentrantCallback(void *arg, ares_status_t status, size_t,
+                                       const ares_dns_record_t *)
+{
+  OperationReentry *data = static_cast<OperationReentry *>(arg);
+  data->published        = data->operation != nullptr;
+  data->result.calls++;
+  data->result.status = status;
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_operation_cancel(data->channel, data->operation));
+  ares_operation_retain(data->operation);
+  ares_operation_release(data->operation);
+  ares_cancel(data->channel);
+}
+
+TEST_P(MockChannelTest, IndividualCancellationSynchronousErrorPublishesToken)
+{
+  OperationReentry data;
+  data.channel = channel_;
+  // The DNS message builder rejects a label longer than 63 bytes.
+  std::string name(64, 'a');
+  name += ".example";
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel_, name.c_str(), ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationReentrantCallback, &data, &data.operation));
+  EXPECT_TRUE(data.published);
+  EXPECT_EQ(1U, data.result.calls);
+  EXPECT_EQ(ARES_EBADNAME, data.result.status);
+  ares_operation_release(data.operation);
+}
+
+TEST_P(MockChannelTest, IndividualCancellationDestroyAndCrossChannel)
+{
+  ares_channel_t *other = nullptr;
+  ASSERT_EQ(ARES_SUCCESS, ares_init(&other));
+  OperationReentry data;
+  data.channel = channel_;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel_, "pending.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationReentrantCallback, &data, &data.operation));
+  EXPECT_EQ(ARES_EFORMERR, ares_operation_cancel(other, data.operation));
+  EXPECT_EQ(0U, data.result.calls);
+  ares_destroy(other);
+  ares_destroy(channel_);
+  channel_ = nullptr;
+  EXPECT_TRUE(data.published);
+  EXPECT_EQ(1U, data.result.calls);
+  EXPECT_EQ(ARES_EDESTRUCTION, data.result.status);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, data.operation));
+  ares_operation_retain(data.operation);
+  ares_operation_release(data.operation);
+  ares_operation_release(data.operation);
+}
+
+TEST_P(MockChannelTest, IndividualCancellationAllocationFailures)
+{
+  bool rejected = false, accepted_error = false, accepted_pending = false;
+  for (int fail = 1; fail < 64; fail++) {
+    OperationResult   result;
+    ares_operation_t *operation = nullptr;
+    SetAllocFail(fail);
+    ares_status_t status = ares_query_dnsrec_cancellable(
+      channel_, "pending.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+      OperationCallback, &result, &operation);
+    ClearFails();
+    if (status != ARES_SUCCESS) {
+      rejected = true;
+      EXPECT_EQ(ARES_ENOMEM, status);
+      EXPECT_EQ(nullptr, operation);
+      EXPECT_EQ(0U, result.calls);
+    } else {
+      ASSERT_NE(nullptr, operation);
+      if (result.calls) {
+        accepted_error = true;
+        EXPECT_EQ(ARES_ENOMEM, result.status);
+      } else {
+        accepted_pending = true;
+      }
+      EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, operation));
+      EXPECT_EQ(1U, result.calls);
+      ares_operation_release(operation);
+    }
+    EXPECT_EQ(0U, ares_queue_active_queries(channel_));
+    if (accepted_pending) {
+      break;
+    }
+  }
+  if (!accepted_pending) {
+    OperationResult   result;
+    ares_operation_t *operation = nullptr;
+    ASSERT_EQ(ARES_SUCCESS,
+              ares_query_dnsrec_cancellable(
+                channel_, "pending.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                OperationCallback, &result, &operation));
+    EXPECT_EQ(0U, result.calls);
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, operation));
+    EXPECT_EQ(1U, result.calls);
+    ares_operation_release(operation);
+  }
+  EXPECT_TRUE(rejected);
+  EXPECT_TRUE(accepted_error);
+}
+
+TEST_F(LibraryTest, IndividualCancellationDiscardsFramesOnPriorRetryConnection)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  writes.blocked = true;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_set_servers_csv(channel, "127.0.0.1:53055,127.0.0.1:53056"));
+  OperationResult   retried, other;
+  ares_operation_t *first = nullptr, *second = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "retry.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &retried, &first));
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  ares_socket_t original = socks[0];
+  timeval       timeout;
+  ASSERT_NE(nullptr, ares_timeout(channel, nullptr, &timeout));
+  std::this_thread::sleep_for(std::chrono::seconds(timeout.tv_sec) +
+                              std::chrono::microseconds(timeout.tv_usec) +
+                              std::chrono::milliseconds(25));
+  // This query keeps the original connection alive while the first fails over.
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "other.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &other, &second));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_process_fds(channel, nullptr, 0, ARES_PROCESS_FLAG_NONE));
+  EXPECT_EQ(2U, ares_queue_active_queries(channel));
+  int mask = ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  EXPECT_NE(
+    0, ARES_GETSOCK_WRITABLE(mask, 1));  // A retry opened another connection.
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, first));
+  writes.blocked = false;
+  ares_process_fd(channel, ARES_SOCKET_BAD, original);
+  EXPECT_EQ((std::vector<std::string>{ "other.example" }),
+            OperationWrittenNames(writes));
+  EXPECT_EQ(1U, retried.calls);
+  EXPECT_EQ(ARES_ECANCELLED, retried.status);
+  EXPECT_EQ(0U, other.calls);
+  ares_destroy(channel);
+  EXPECT_EQ(1U, retried.calls);
+  EXPECT_EQ(1U, other.calls);
+  ares_operation_release(first);
+  ares_operation_release(second);
+}
+
+TEST_P(CacheQueriesTest, IndividualCancellationSynchronousCachePublishesToken)
+{
+  DNSPacket reply;
+  reply.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("cached.example", T_A))
+    .add_answer(new DNSARR("cached.example", 100, { 1, 2, 3, 4 }));
+  EXPECT_CALL(server_, OnRequest("cached.example", T_A))
+    .WillOnce(SetReply(&server_, &reply));
+  OperationResult   first;
+  ares_operation_t *op = nullptr;
+  ASSERT_EQ(ARES_SUCCESS, ares_query_dnsrec_cancellable(
+                            channel_, "cached.example", ARES_CLASS_IN,
+                            ARES_REC_TYPE_A, OperationCallback, &first, &op));
+  Process();
+  EXPECT_EQ(ARES_SUCCESS, first.status);
+  ares_operation_release(op);
+  OperationReentry data;
+  data.channel = channel_;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel_, "cached.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationReentrantCallback, &data, &data.operation));
+  EXPECT_TRUE(data.published);
+  EXPECT_EQ(1U, data.result.calls);
+  EXPECT_EQ(ARES_SUCCESS, data.result.status);
+  ares_operation_release(data.operation);
+}
+
+TEST_P(MockChannelTest, IndividualCancellationReleaseBeforeCompletion)
+{
+  OperationResult   result;
+  ares_operation_t *operation = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel_, "pending.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &result, &operation));
+  ares_operation_release(operation);
+  ares_cancel(channel_);
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_EQ(ARES_ECANCELLED, result.status);
+}
+
+#ifndef CARES_SYMBOL_HIDING
+TEST_F(LibraryTest,
+       IndividualCancellationReusedWireIdKeepsExistingResponseMatching)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  writes.limit = 4;  // Length prefix plus the complete wire ID.
+  OperationResult   cancelled, replacement;
+  ares_operation_t *first = nullptr, *second = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "same.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &cancelled, &first));
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  ASSERT_EQ(4U, writes.bytes.size());
+  unsigned short id =
+    static_cast<unsigned short>(writes.bytes[2] * 256 + writes.bytes[3]);
+  ASSERT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, first));
+  writes.blocked = true;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "same.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &replacement, &second));
+  ForceOperationWireId(second, id);
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_operation_cancel(channel, first));  // Stale token.
+  EXPECT_EQ(0U, replacement.calls);
+  writes.blocked = false;
+  writes.limit   = static_cast<size_t>(-1);
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  EXPECT_EQ((std::vector<std::string>{ "same.example", "same.example" }),
+            OperationWrittenNames(writes));
+  size_t second_offset =
+    2 + static_cast<size_t>(writes.bytes[0]) * 256 + writes.bytes[1];
+  ASSERT_LT(second_offset + 3, writes.bytes.size());
+  EXPECT_EQ(id,
+            static_cast<unsigned short>(writes.bytes[second_offset + 2] * 256 +
+                                        writes.bytes[second_offset + 3]));
+  OperationQueueResponse(&writes, "same.example",
+                         static_cast<unsigned short>(id + 1));
+  ares_process_fd(channel, socks[0], ARES_SOCKET_BAD);
+  EXPECT_EQ(0U, replacement.calls);  // Unknown ID is discarded.
+  OperationQueueResponse(&writes, "different.example", id);
+  ares_process_fd(channel, socks[0], ARES_SOCKET_BAD);
+  EXPECT_EQ(0U, replacement.calls);  // Different question is discarded.
+  OperationQueueResponse(&writes, "same.example", id);  // A's delayed response.
+  ares_process_fd(channel, socks[0], ARES_SOCKET_BAD);
+  EXPECT_EQ(1U, replacement.calls);  // Accepted D5 boundary: may satisfy B.
+  EXPECT_EQ(ARES_SUCCESS, replacement.status);
+  OperationQueueResponse(&writes, "same.example", id);  // B's later response.
+  ares_process_fd(channel, socks[0], ARES_SOCKET_BAD);
+  EXPECT_EQ(1U, replacement.calls);
+  EXPECT_EQ(1U, cancelled.calls);
+  EXPECT_EQ(ARES_ECANCELLED, cancelled.status);
+  ares_destroy(channel);
+  ares_operation_release(first);
+  ares_operation_release(second);
+}
+#endif
+
+struct OperationCancelOther {
+  ares_channel_t   *channel;
+  ares_operation_t *other = nullptr;
+  OperationResult   result;
+};
+
+static void OperationCancelOtherCallback(void *arg, ares_status_t status,
+                                         size_t, const ares_dns_record_t *)
+{
+  OperationCancelOther *data = static_cast<OperationCancelOther *>(arg);
+  data->result.calls++;
+  data->result.status = status;
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(data->channel, data->other));
+}
+
+TEST_F(LibraryTest, IndividualCancellationWinsAgainstQueuedCompletion)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes);
+  ASSERT_NE(nullptr, channel);
+  OperationCancelOther first;
+  first.channel = channel;
+  OperationResult   other;
+  ares_operation_t *op = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "first.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCancelOtherCallback, &first, &op));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "other.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &other, &first.other));
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  size_t offset = 0;
+  for (const char *name : { "first.example", "other.example" }) {
+    ASSERT_LT(offset + 3, writes.bytes.size());
+    unsigned short id = static_cast<unsigned short>(
+      writes.bytes[offset + 2] * 256 + writes.bytes[offset + 3]);
+    OperationQueueResponse(&writes, name, id);
+    offset += 2 + static_cast<size_t>(writes.bytes[offset]) * 256 +
+              writes.bytes[offset + 1];
+  }
+  // Both completions enter the same end queue before the first callback cancels
+  // the second operation. Its queued response must be freed without notifying.
+  ares_process_fd(channel, socks[0], ARES_SOCKET_BAD);
+  EXPECT_EQ(1U, first.result.calls);
+  EXPECT_EQ(ARES_SUCCESS, first.result.status);
+  EXPECT_EQ(1U, other.calls);
+  EXPECT_EQ(ARES_ECANCELLED, other.status);
+  EXPECT_EQ(0U, ares_queue_active_queries(channel));
+  ares_destroy(channel);
+  ares_operation_release(op);
+  ares_operation_release(first.other);
+}
+
+TEST_F(LibraryTest, IndividualCancellationDiscardsUnsentUDPDatagram)
+{
+  OperationWrites writes;
+  ares_channel_t *channel = OperationChannel(&writes, false);
+  ASSERT_NE(nullptr, channel);
+  writes.blocked = true;
+  OperationResult   cancelled, other;
+  ares_operation_t *first = nullptr, *second = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(
+              channel, "cancel.example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+              OperationCallback, &cancelled, &first));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec_cancellable(channel, "other.example",
+                                          ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                          OperationCallback, &other, &second));
+  EXPECT_TRUE(writes.bytes.empty());
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel, first));
+  ares_socket_t socks[ARES_GETSOCK_MAXNUM];
+  ares_getsock(channel, socks, ARES_GETSOCK_MAXNUM);
+  writes.blocked = false;
+  ares_process_fd(channel, ARES_SOCKET_BAD, socks[0]);
+  ares_dns_record_t *record = nullptr;
+  ASSERT_EQ(ARES_SUCCESS, ares_dns_parse(writes.bytes.data(),
+                                         writes.bytes.size(), 0, &record));
+  const char *name = nullptr;
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_dns_record_query_get(record, 0, &name, nullptr, nullptr));
+  EXPECT_STREQ("other.example", name);
+  ares_dns_record_destroy(record);
+  ares_destroy(channel);
+  EXPECT_EQ(1U, cancelled.calls);
+  EXPECT_EQ(1U, other.calls);
+  ares_operation_release(first);
+  ares_operation_release(second);
+}
+
+TEST_P(MockChannelTest,
+       IndividualCancellationRejectsMissingArgumentsBeforeAcceptance)
+{
+  OperationResult   result;
+  ares_operation_t *op = nullptr;
+  EXPECT_EQ(ARES_EFORMERR, ares_query_dnsrec_cancellable(
+                             nullptr, "example", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                             OperationCallback, &result, &op));
+  EXPECT_EQ(ARES_EFORMERR, ares_query_dnsrec_cancellable(
+                             channel_, nullptr, ARES_CLASS_IN, ARES_REC_TYPE_A,
+                             OperationCallback, &result, &op));
+  EXPECT_EQ(ARES_EFORMERR, ares_query_dnsrec_cancellable(
+                             channel_, "example", ARES_CLASS_IN,
+                             ARES_REC_TYPE_A, nullptr, &result, &op));
+  EXPECT_EQ(ARES_EFORMERR,
+            ares_query_dnsrec_cancellable(channel_, "example", ARES_CLASS_IN,
+                                          ARES_REC_TYPE_A, OperationCallback,
+                                          &result, nullptr));
+  EXPECT_EQ(ARES_EFORMERR,
+            ares_send_dnsrec_cancellable(channel_, nullptr, OperationCallback,
+                                         &result, &op));
+  EXPECT_EQ(ARES_EFORMERR, ares_operation_cancel(channel_, nullptr));
+  ares_operation_retain(nullptr);
+  ares_operation_release(nullptr);
+  EXPECT_EQ(nullptr, op);
+  EXPECT_EQ(0U, result.calls);
+  EXPECT_EQ(0U, ares_queue_active_queries(channel_));
 }
 
 TEST_P(MockChannelTest, CancelImmediate) {

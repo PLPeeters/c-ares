@@ -460,9 +460,117 @@ done:
   return err;
 }
 
+typedef struct {
+  ares_uint64_t serial;
+  size_t        remaining;
+  ares_bool_t   started;
+  ares_bool_t   cancelled;
+} ares_conn_frame_t;
+
+ares_status_t ares_conn_enqueue_nolock(ares_conn_t        *conn,
+                                       const ares_query_t *query)
+{
+  ares_conn_frame_t *frame;
+  ares_llist_node_t *node;
+  ares_status_t      status;
+  size_t             before = ares_buf_len(conn->out_buf);
+
+  frame = ares_malloc_zero(sizeof(*frame));
+  if (frame == NULL) {
+    return ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+  frame->serial = query->serial;
+  node          = ares_llist_insert_last(conn->out_frames, frame);
+  if (node == NULL) {
+    ares_free(frame);   /* LCOV_EXCL_LINE: OutOfMemory */
+    return ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+  status = ares_dns_write_buf_tcp(query->query, conn->out_buf);
+  if (status != ARES_SUCCESS) {
+    ares_buf_remove(conn->out_buf, before,
+                    ares_buf_len(conn->out_buf) - before);
+    ares_llist_node_destroy(node);
+    return status;
+  }
+  frame->remaining = ares_buf_len(conn->out_buf) - before;
+  return ARES_SUCCESS;
+}
+
+/* Account for a write before removing cancelled frames: the socket function
+ * may have reentrantly cancelled a query while borrowing the output bytes. */
+static void ares_conn_frame_consume(ares_conn_t *conn, size_t count)
+{
+  while (count != 0) {
+    ares_llist_node_t *node  = ares_llist_node_first(conn->out_frames);
+    ares_conn_frame_t *frame = ares_llist_node_val(node);
+    size_t consumed   = count < frame->remaining ? count : frame->remaining;
+    frame->started    = ARES_TRUE;
+    frame->remaining -= consumed;
+    count            -= consumed;
+    if (frame->remaining == 0) {
+      ares_llist_node_destroy(node);
+    }
+  }
+}
+
+static void ares_conn_frame_prune(ares_conn_t *conn)
+{
+  ares_llist_node_t *node;
+  size_t             offset = 0;
+
+  if (conn->out_write_active) {
+    return;
+  }
+  node = ares_llist_node_first(conn->out_frames);
+  while (node != NULL) {
+    ares_conn_frame_t *frame = ares_llist_node_val(node);
+    ares_llist_node_t *next  = ares_llist_node_next(node);
+    if (frame->cancelled && !frame->started) {
+      ares_buf_remove(conn->out_buf, offset, frame->remaining);
+      ares_llist_node_destroy(node);
+    } else {
+      offset += frame->remaining;
+    }
+    node = next;
+  }
+}
+
+void ares_conn_discard_query_nolock(ares_channel_t *channel,
+                                    ares_uint64_t   serial)
+{
+  ares_slist_node_t *server_node;
+
+  /* A retry may have left output on an older connection. Current query->conn
+   * membership alone does not describe ownership of those buffered frames. */
+  for (server_node = ares_slist_node_first(channel->servers);
+       server_node != NULL; server_node = ares_slist_node_next(server_node)) {
+    ares_server_t     *server = ares_slist_node_val(server_node);
+    ares_llist_node_t *conn_node;
+    for (conn_node = ares_llist_node_first(server->connections);
+         conn_node != NULL; conn_node = ares_llist_node_next(conn_node)) {
+      ares_conn_t       *conn = ares_llist_node_val(conn_node);
+      ares_llist_node_t *frame_node;
+      for (frame_node = ares_llist_node_first(conn->out_frames);
+           frame_node != NULL; frame_node = ares_llist_node_next(frame_node)) {
+        ares_conn_frame_t *frame = ares_llist_node_val(frame_node);
+        if (frame->serial == serial) {
+          frame->cancelled = ARES_TRUE;
+        }
+      }
+      ares_conn_frame_prune(conn);
+      if (conn->flags & ARES_CONN_FLAG_TCP &&
+          conn->state_flags & ARES_CONN_STATE_CONNECTED &&
+          ares_buf_len(conn->out_buf) == 0) {
+        ares_conn_sock_state_cb_update(conn, ARES_CONN_STATE_READ);
+      }
+    }
+  }
+}
+
 ares_status_t ares_conn_flush(ares_conn_t *conn)
 {
   const unsigned char *data;
+  unsigned char       *snapshot;
   size_t               data_len;
   size_t               count;
   ares_conn_err_t      err;
@@ -471,6 +579,10 @@ ares_status_t ares_conn_flush(ares_conn_t *conn)
 
   if (conn == NULL) {
     return ARES_EFORMERR;
+  }
+
+  if (conn->out_write_active) {
+    return ARES_SUCCESS;
   }
 
   if (conn->flags & ARES_CONN_FLAG_TFO_INITIAL) {
@@ -505,8 +617,22 @@ ares_status_t ares_conn_flush(ares_conn_t *conn)
       data_len  = msg_len;
     }
 
-    err = ares_conn_write(conn, data, data_len, &count);
+    /* A socket callback may cancel a query whose terminal callback enqueues
+     * more output, reallocating out_buf before the socket callback has finished
+     * reading it. Keep this write's bytes independent until that call returns.
+     */
+    snapshot = ares_malloc(data_len);
+    if (snapshot == NULL) {
+      status = ARES_ENOMEM;
+      goto done;
+    }
+    memcpy(snapshot, data, data_len);
+    conn->out_write_active = ARES_TRUE;
+    err                    = ares_conn_write(conn, snapshot, data_len, &count);
+    ares_free(snapshot);
+    conn->out_write_active = ARES_FALSE;
     if (err != ARES_CONN_ERR_SUCCESS) {
+      ares_conn_frame_prune(conn);
       if (err != ARES_CONN_ERR_WOULDBLOCK) {
         status = ARES_ECONNREFUSED;
         goto done;
@@ -522,6 +648,8 @@ ares_status_t ares_conn_flush(ares_conn_t *conn)
 
     /* Strip data written from the buffer */
     ares_buf_consume(conn->out_buf, count);
+    ares_conn_frame_consume(conn, count);
+    ares_conn_frame_prune(conn);
     status = ARES_SUCCESS;
 
     /* Loop only for UDP since we have to send per-packet.  We already
@@ -592,10 +720,11 @@ ares_status_t ares_open_connection(ares_conn_t   **conn_out,
   conn->queries_to_conn = ares_llist_create(NULL);
   conn->flags           = is_tcp ? ARES_CONN_FLAG_TCP : ARES_CONN_FLAG_NONE;
   conn->out_buf         = ares_buf_create();
+  conn->out_frames      = ares_llist_create(ares_free);
   conn->in_buf          = ares_buf_create();
 
   if (conn->queries_to_conn == NULL || conn->out_buf == NULL ||
-      conn->in_buf == NULL) {
+      conn->in_buf == NULL || conn->out_frames == NULL) {
     /* LCOV_EXCL_START: OutOfMemory */
     status = ARES_ENOMEM;
     goto done;
@@ -735,6 +864,7 @@ done:
     ares_llist_node_claim(node);
     ares_llist_destroy(conn->queries_to_conn);
     ares_socket_close(channel, conn->fd);
+    ares_llist_destroy(conn->out_frames);
     ares_buf_destroy(conn->out_buf);
     ares_buf_destroy(conn->in_buf);
     ares_free(conn);

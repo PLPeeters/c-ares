@@ -142,13 +142,41 @@ W32_FUNC const char *_w32_GetHostsFile(void);
 struct ares_query;
 typedef struct ares_query ares_query_t;
 
+struct ares_operation {
+  ares_thread_mutex_t *lock;
+  size_t               refs;
+  ares_channel_t      *channel;
+  ares_query_t        *query;
+  ares_bool_t          terminal;
+  ares_callback_dnsrec callback;
+  void                *arg;
+};
+
+/*! Allocate caller and active references; caller holds channel lock.
+ *  \param[in] channel Submitting channel.
+ *  \param[in] callback Terminal callback.
+ *  \param[in] arg Callback argument.
+ *  \return Token, or NULL on allocation failure.
+ */
+ares_operation_t *ares_operation_create_nolock(ares_channel_t      *channel,
+                                               ares_callback_dnsrec callback,
+                                               void                *arg);
+/*! Select terminality before notifying and release the active reference.
+ *  \param[in] arg Operation token.
+ *  \param[in] status Terminal status.
+ *  \param[in] timeouts Timeout count.
+ *  \param[in] dnsrec Borrowed response.
+ */
+void ares_operation_callback(void *arg, ares_status_t status, size_t timeouts,
+                             const ares_dns_record_t *dnsrec);
+
 /* State to represent a DNS query */
 struct ares_query {
   /* Query ID from qbuf, for faster lookup, and current timeout */
   unsigned short       qid; /* host byte order */
   /*! Distinguishes this query from any later one handed the same qid.
    *  Query ids are 16-bit and recycled; this counter is not. */
-  size_t               serial;
+  ares_uint64_t        serial;
   ares_timeval_t       ts; /*!< Timestamp query was sent */
   ares_timeval_t       timeout;
   ares_channel_t      *channel;
@@ -249,7 +277,7 @@ struct ares_channeldata {
 
   /*! Monotonic source for ares_query_t.serial.  Never reused for the life of
    *  the channel, so a recycled query id cannot impersonate an older query. */
-  size_t               query_serial;
+  ares_uint64_t        query_serial;
 
   /* Queries bucketed by timeout, for quickly handling timeouts: */
   ares_slist_t        *queries_by_timeout;
@@ -603,6 +631,22 @@ ares_status_t ares_send_nolock(ares_channel_t *channel, ares_server_t *server,
                                const ares_dns_record_t *dnsrec,
                                ares_callback_dnsrec callback, void *arg,
                                unsigned short *qid);
+
+/*! Send with an optional operation owner, with channel lock held.
+ *  \param[in] channel Channel.
+ *  \param[in] server Optional selected server.
+ *  \param[in] flags Send flags.
+ *  \param[in] dnsrec Query record.
+ *  \param[in] callback Callback.
+ *  \param[in] arg Callback argument.
+ *  \param[out] qid Optional wire ID.
+ *  \param[in] operation Optional logical operation owner.
+ *  \return Send status.
+ */
+ares_status_t ares_send_operation_nolock(
+  ares_channel_t *channel, ares_server_t *server, ares_send_flags_t flags,
+  const ares_dns_record_t *dnsrec, ares_callback_dnsrec callback, void *arg,
+  unsigned short *qid, ares_operation_t *operation);
 
 /* Same as ares_gethostbyaddr() except does not take a channel lock.  Use this
  * if a channel lock is already held */

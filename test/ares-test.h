@@ -121,6 +121,13 @@ std::string
   PrintFamilyMode(const testing::TestParamInfo<std::pair<int, bool>> &info);
 std::string PrintFamily(const testing::TestParamInfo<int> &info);
 
+#ifndef CARES_SYMBOL_HIDING
+// Quiescent fixture setup only; the operation's last frame must be unsent.
+void ForceOperationWireId(ares_operation_t *operation, unsigned short id);
+// Quiescent fixture setup: leave exactly one unused frame lifetime identity.
+void ExhaustOperationSerials(ares_channel_t *channel);
+#endif
+
 // Test fixture that ensures library initialization, and allows
 // memory allocations to be failed.
 class LibraryTest : public ::testing::Test {
