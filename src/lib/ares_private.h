@@ -146,9 +146,12 @@ struct ares_operation {
   ares_thread_mutex_t *lock;
   size_t               refs;
   ares_channel_t      *channel;
-  ares_query_t        *query;
+  ares_llist_t          *queries;
   ares_bool_t          terminal;
   ares_callback_dnsrec callback;
+  ares_addrinfo_callback addrinfo_callback;
+  void (*cancel_callback)(void *arg, ares_status_t status);
+  void                *cancel_arg;
   void                *arg;
 };
 
@@ -169,6 +172,17 @@ ares_operation_t *ares_operation_create_nolock(ares_channel_t      *channel,
  */
 void ares_operation_callback(void *arg, ares_status_t status, size_t timeouts,
                              const ares_dns_record_t *dnsrec);
+
+/*! Select an irreversible terminal outcome with the channel lock held.
+ *  \param[in] operation Live operation.
+ */
+void ares_operation_set_terminal_nolock(ares_operation_t *operation);
+/*! Drain all owned native queries with the channel lock held.
+ *  \param[in] operation Live operation.
+ *  \param[in] status Selected cancellation or destruction status.
+ */
+void ares_operation_drain_nolock(ares_operation_t *operation,
+                                 ares_status_t     status);
 
 /* State to represent a DNS query */
 struct ares_query {
@@ -191,6 +205,8 @@ struct ares_query {
   ares_slist_node_t   *node_queries_by_timeout;
   ares_llist_node_t   *node_queries_to_conn;
   ares_llist_node_t   *node_all_queries;
+  ares_llist_node_t   *node_operation;
+  ares_operation_t    *operation;
 
   /* connection handle query is associated with */
   ares_conn_t         *conn;
@@ -646,6 +662,22 @@ ares_status_t ares_send_nolock(ares_channel_t *channel, ares_server_t *server,
 ares_status_t ares_send_operation_nolock(
   ares_channel_t *channel, ares_server_t *server, ares_send_flags_t flags,
   const ares_dns_record_t *dnsrec, ares_callback_dnsrec callback, void *arg,
+  unsigned short *qid, ares_operation_t *operation);
+
+/*! Submit an owned query with the channel lock held.
+ *  \param[in] channel Live channel.
+ *  \param[in] name Query name.
+ *  \param[in] dnsclass DNS class.
+ *  \param[in] type Record type.
+ *  \param[in] callback Child callback.
+ *  \param[in] arg Child callback argument.
+ *  \param[out] qid Optional wire ID.
+ *  \param[in] operation Optional logical owner.
+ *  \return Query status.
+ */
+ares_status_t ares_query_operation_nolock(
+  ares_channel_t *channel, const char *name, ares_dns_class_t dnsclass,
+  ares_dns_rec_type_t type, ares_callback_dnsrec callback, void *arg,
   unsigned short *qid, ares_operation_t *operation);
 
 /* Same as ares_gethostbyaddr() except does not take a channel lock.  Use this

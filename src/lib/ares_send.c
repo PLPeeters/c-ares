@@ -278,9 +278,16 @@ ares_status_t ares_send_operation_nolock(
   }
 
   if (operation != NULL) {
-    ares_thread_mutex_lock(operation->lock);
-    operation->query = query;
-    ares_thread_mutex_unlock(operation->lock);
+    query->node_operation = ares_llist_insert_last(operation->queries, query);
+    if (query->node_operation == NULL) {
+      /* LCOV_EXCL_START: OutOfMemory */
+      ares_detach_query(query);
+      callback(arg, ARES_ENOMEM, 0, NULL);
+      ares_free_query(query);
+      return ARES_ENOMEM;
+      /* LCOV_EXCL_STOP */
+    }
+    query->operation = operation;
   }
 
   /* Perform the first query action. */

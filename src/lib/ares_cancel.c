@@ -95,9 +95,15 @@ ares_operation_t *ares_operation_create_nolock(ares_channel_t      *channel,
   if (operation == NULL) {
     return NULL;
   }
+  operation->queries = ares_llist_create(NULL);
+  if (operation->queries == NULL) {
+    ares_free(operation);
+    return NULL;
+  }
 #ifdef CARES_THREADS
   operation->lock = ares_thread_mutex_create();
   if (operation->lock == NULL) {
+    ares_llist_destroy(operation->queries);
     ares_free(operation);
     return NULL;
   }
@@ -130,9 +136,31 @@ void ares_operation_release(ares_operation_t *operation)
   destroy = operation->refs == 0 ? ARES_TRUE : ARES_FALSE;
   ares_thread_mutex_unlock(operation->lock);
   if (destroy) {
+    ares_llist_destroy(operation->queries);
     ares_thread_mutex_destroy(operation->lock);
     ares_free(operation);
   }
+}
+
+void ares_operation_set_terminal_nolock(ares_operation_t *operation)
+{
+  ares_thread_mutex_lock(operation->lock);
+  operation->terminal = ARES_TRUE;
+  ares_thread_mutex_unlock(operation->lock);
+}
+
+void ares_operation_drain_nolock(ares_operation_t *operation,
+                                 ares_status_t     status)
+{
+  ares_query_t *query;
+  /* A last-child callback may release both active and caller references. */
+  ares_operation_retain(operation);
+  while ((query = ares_llist_first_val(operation->queries)) != NULL) {
+    ares_detach_query(query);
+    query->callback(query->arg, status, query->timeouts, NULL);
+    ares_free_query(query);
+  }
+  ares_operation_release(operation);
 }
 
 void ares_operation_callback(void *arg, ares_status_t status, size_t timeouts,
@@ -144,11 +172,12 @@ void ares_operation_callback(void *arg, ares_status_t status, size_t timeouts,
 
   ares_thread_mutex_lock(operation->lock);
   operation->terminal = ARES_TRUE;
-  operation->query    = NULL;
   callback            = operation->callback;
   callback_arg        = operation->arg;
   operation->callback = NULL;
   operation->arg      = NULL;
+  operation->cancel_callback = NULL;
+  operation->cancel_arg      = NULL;
   ares_thread_mutex_unlock(operation->lock);
   callback(callback_arg, status, timeouts, dnsrec);
   ares_operation_release(operation);
@@ -157,7 +186,6 @@ void ares_operation_callback(void *arg, ares_status_t status, size_t timeouts,
 ares_status_t ares_operation_cancel(ares_channel_t   *channel,
                                     ares_operation_t *operation)
 {
-  ares_query_t *query;
   ares_bool_t   terminal;
 
   if (operation == NULL) {
@@ -179,12 +207,15 @@ ares_status_t ares_operation_cancel(ares_channel_t   *channel,
   ares_channel_lock(channel);
   ares_deferred_cb_enter(channel);
   ares_thread_mutex_lock(operation->lock);
-  query = operation->query;
+  terminal = operation->terminal;
   ares_thread_mutex_unlock(operation->lock);
-  if (query != NULL) {
-    ares_detach_query(query);
-    query->callback(query->arg, ARES_ECANCELLED, query->timeouts, NULL);
-    ares_free_query(query);
+  if (!terminal) {
+    ares_operation_set_terminal_nolock(operation);
+    if (operation->cancel_callback != NULL) {
+      operation->cancel_callback(operation->cancel_arg, ARES_ECANCELLED);
+    } else {
+      ares_operation_drain_nolock(operation, ARES_ECANCELLED);
+    }
   }
   ares_check_cleanup_conns(channel);
   ares_queue_notify_empty(channel);

@@ -48,6 +48,10 @@ struct search_query {
   size_t               next_name_idx; /* next name index being attempted */
   size_t      timeouts;        /* number of timeouts we saw for this request */
   ares_bool_t ever_got_nodata; /* did we ever get ARES_ENODATA along the way? */
+  ares_operation_t *operation;
+  size_t            refs;
+  ares_status_t     stop_status;
+  ares_bool_t       completed;
 };
 
 static void squery_free(struct search_query *squery)
@@ -63,11 +67,33 @@ static void squery_free(struct search_query *squery)
 /* End a search query by invoking the user callback and freeing the
  * search_query structure.
  */
+static void squery_release(struct search_query *squery)
+{
+  squery->refs--;
+  if (squery->refs == 0) {
+    squery_free(squery);
+  }
+}
+
 static void end_squery(struct search_query *squery, ares_status_t status,
                        const ares_dns_record_t *dnsrec)
 {
+  squery->completed = ARES_TRUE;
   squery->callback(squery->arg, status, squery->timeouts, dnsrec);
-  squery_free(squery);
+  squery_release(squery);
+}
+
+static void stop_squery(void *arg, ares_status_t status)
+{
+  struct search_query *squery = arg;
+  squery->refs++;
+  squery->stop_status = status;
+  ares_operation_set_terminal_nolock(squery->operation);
+  ares_operation_drain_nolock(squery->operation, status);
+  if (!squery->completed) {
+    end_squery(squery, status, NULL);
+  }
+  squery_release(squery);
 }
 
 static void search_callback(void *arg, ares_status_t status, size_t timeouts,
@@ -92,18 +118,22 @@ static ares_status_t ares_search_next(ares_channel_t      *channel,
     return status;
   }
 
-  status = ares_send_nolock(channel, NULL, 0, squery->dnsrec, search_callback,
-                            squery, NULL);
+  squery->refs++;
+  status = ares_send_operation_nolock(channel, NULL, 0, squery->dnsrec,
+                                      search_callback, squery, NULL,
+                                      squery->operation);
 
   if (status != ARES_EFORMERR) {
     *skip_cleanup = ARES_TRUE;
   }
+  squery_release(squery);
 
   return status;
 }
 
-static void search_callback(void *arg, ares_status_t status, size_t timeouts,
-                            const ares_dns_record_t *dnsrec)
+static void search_callback_int(void *arg, ares_status_t status,
+                                size_t                   timeouts,
+                                const ares_dns_record_t *dnsrec)
 {
   struct search_query *squery  = (struct search_query *)arg;
   ares_channel_t      *channel = squery->channel;
@@ -164,6 +194,25 @@ static void search_callback(void *arg, ares_status_t status, size_t timeouts,
   }
 
   end_squery(squery, mystatus, NULL);
+}
+
+static void search_callback(void *arg, ares_status_t status, size_t timeouts,
+                            const ares_dns_record_t *dnsrec)
+{
+  struct search_query *squery = arg;
+  squery->refs++;
+  if (squery->operation != NULL &&
+      (status == ARES_ECANCELLED || status == ARES_EDESTRUCTION)) {
+    squery->timeouts += timeouts;
+    if (squery->stop_status != ARES_SUCCESS) {
+      end_squery(squery, squery->stop_status, NULL);
+    } else {
+      stop_squery(squery, status);
+    }
+  } else {
+    search_callback_int(arg, status, timeouts, dnsrec);
+  }
+  squery_release(squery);
 }
 
 /* Determine if the domain should be looked up as-is, or if it is eligible
@@ -312,7 +361,8 @@ done:
 
 static ares_status_t ares_search_int(ares_channel_t          *channel,
                                      const ares_dns_record_t *dnsrec,
-                                     ares_callback_dnsrec callback, void *arg)
+                                     ares_callback_dnsrec callback, void *arg,
+                                     ares_operation_t *operation)
 {
   struct search_query *squery = NULL;
   const char          *name;
@@ -348,6 +398,7 @@ static ares_status_t ares_search_int(ares_channel_t          *channel,
   }
 
   squery->channel = channel;
+  squery->refs    = 1;
 
   /* Duplicate DNS record since, name will need to be rewritten */
   squery->dnsrec = ares_dns_record_duplicate(dnsrec);
@@ -367,6 +418,11 @@ static ares_status_t ares_search_int(ares_channel_t          *channel,
     goto fail;
   }
 
+  squery->operation = operation;
+  if (operation != NULL) {
+    operation->cancel_callback = stop_squery;
+    operation->cancel_arg      = squery;
+  }
   status = ares_search_next(channel, squery, &skip_cleanup);
   if (status != ARES_SUCCESS) {
     goto fail;
@@ -467,7 +523,7 @@ void ares_search(ares_channel_t *channel, const char *name, int dnsclass,
    * has unwound, not from inside the internals it runs.  See
    * ares_deferred_cb_enter(). */
   ares_deferred_cb_enter(channel);
-  ares_search_int(channel, dnsrec, ares_dnsrec_convert_cb, carg);
+  ares_search_int(channel, dnsrec, ares_dnsrec_convert_cb, carg, NULL);
   ares_deferred_cb_leave(channel);
   ares_channel_unlock(channel);
 
@@ -490,10 +546,44 @@ ares_status_t ares_search_dnsrec(ares_channel_t          *channel,
    * has unwound, not from inside the internals it runs.  See
    * ares_deferred_cb_enter(). */
   ares_deferred_cb_enter(channel);
-  status = ares_search_int(channel, dnsrec, callback, arg);
+  status = ares_search_int(channel, dnsrec, callback, arg, NULL);
   ares_deferred_cb_leave(channel);
   ares_channel_unlock(channel);
 
+  return status;
+}
+
+ares_status_t ares_search_dnsrec_cancellable(ares_channel_t          *channel,
+                                             const ares_dns_record_t *dnsrec,
+                                             ares_callback_dnsrec     callback,
+                                             void                    *arg,
+                                             ares_operation_t       **operation)
+{
+  ares_operation_t *op;
+  ares_status_t     status = ARES_SUCCESS;
+  if (operation != NULL) {
+    *operation = NULL;
+  }
+  if (channel == NULL || dnsrec == NULL || callback == NULL ||
+      operation == NULL) {
+    return ARES_EFORMERR;
+  }
+  ares_channel_lock(channel);
+  if (!channel->sys_up) {
+    status = ARES_EDESTRUCTION;
+    goto done;
+  }
+  op = ares_operation_create_nolock(channel, callback, arg);
+  if (op == NULL) {
+    status = ARES_ENOMEM;
+    goto done;
+  }
+  *operation = op;
+  ares_deferred_cb_enter(channel);
+  ares_search_int(channel, dnsrec, ares_operation_callback, op, op);
+  ares_deferred_cb_leave(channel);
+done:
+  ares_channel_unlock(channel);
   return status;
 }
 

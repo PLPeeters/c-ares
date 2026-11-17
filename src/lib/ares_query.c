@@ -58,7 +58,7 @@ static void ares_query_dnsrec_cb(void *arg, ares_status_t status,
   ares_free(qquery);
 }
 
-static ares_status_t ares_query_operation_nolock(
+ares_status_t ares_query_operation_nolock(
   ares_channel_t *channel, const char *name, ares_dns_class_t dnsclass,
   ares_dns_rec_type_t type, ares_callback_dnsrec callback, void *arg,
   unsigned short *qid, ares_operation_t *operation)

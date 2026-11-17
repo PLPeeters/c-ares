@@ -4,6 +4,7 @@
 .TH ARES_OPERATION 3 "16 November 2026"
 .SH NAME
 ares_operation_t, ares_query_dnsrec_cancellable, ares_send_dnsrec_cancellable,
+ares_getaddrinfo_cancellable, ares_search_dnsrec_cancellable,
 ares_operation_cancel, ares_operation_retain, ares_operation_release \-
 submit and individually cancel retained DNS operations
 .SH SYNOPSIS
@@ -21,19 +22,41 @@ submit and individually cancel retained DNS operations
    ares_channel_t *channel, const ares_dns_record_t *dnsrec,
    ares_callback_dnsrec callback, void *arg, ares_operation_t **operation);
 
+ ares_status_t ares_getaddrinfo_cancellable(
+   ares_channel_t *channel, const char *node, const char *service,
+   const struct ares_addrinfo_hints *hints, ares_addrinfo_callback callback,
+   void *arg, ares_operation_t **operation);
+
+ ares_status_t ares_search_dnsrec_cancellable(
+   ares_channel_t *channel, const ares_dns_record_t *dnsrec,
+   ares_callback_dnsrec callback, void *arg, ares_operation_t **operation);
+
  ares_status_t ares_operation_cancel(ares_channel_t *channel,
                                      ares_operation_t *operation);
  void ares_operation_retain(ares_operation_t *operation);
  void ares_operation_release(ares_operation_t *operation);
 .fi
 .SH DESCRIPTION
-These submissions perform the same raw DNS work and response conversion as
+The raw submissions perform the same DNS work and response conversion as
 .BR ares_query_dnsrec (3)
 and
 .BR ares_send_dnsrec (3),
 respectively, and return an opaque operation token. Existing submission APIs
 are unchanged. This token is a logical operation identity, not a DNS wire ID.
-Search and address-lookup operations are not provided by these functions.
+.PP
+.B ares_getaddrinfo_cancellable
+performs the same address lookup as
+.BR ares_getaddrinfo (3).
+Its token owns the entire lookup, including both A and AAAA requests for
+AF_UNSPEC, all search candidates, retries, failover, and UDP-to-TCP fallback.
+Cancellation stops every owned child before delivering one terminal callback,
+forbids further child submissions, and discards partial address results.
+Successful address results transfer to the caller and must be freed with
+.BR ares_freeaddrinfo (3).
+.B ares_search_dnsrec_cancellable
+performs the same logical search as
+.BR ares_search_dnsrec (3),
+owning every candidate and its transport work under one token.
 .PP
 On acceptance the function returns
 .BR ARES_SUCCESS ,
@@ -44,7 +67,10 @@ cache hits. Publication precedes callback eligibility: the callback can read
 the output token and reenter cancellation or retain/release. The callback may
 run before submission returns. A non-success return means no acceptance, no
 callback, and a NULL output token. The output pointer, channel, callback, and
-query input must be non-NULL. The raw DNS record is duplicated; it need not
+query input must be non-NULL, except that address lookups accept NULL node,
+service, or hints according to
+.BR ares_getaddrinfo (3).
+The raw DNS record is duplicated; it need not
 remain alive after submission returns. Response records remain borrowed for
 the duration of the callback, as with the existing APIs.
 .PP
@@ -122,6 +148,8 @@ accept NULL as a no-op.
 .SH SEE ALSO
 .BR ares_query_dnsrec (3),
 .BR ares_send_dnsrec (3),
+.BR ares_getaddrinfo (3),
+.BR ares_search_dnsrec (3),
 .BR ares_cancel (3),
 .BR ares_destroy (3),
 .BR ares_threadsafety (3)

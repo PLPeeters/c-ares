@@ -830,6 +830,33 @@ CARES_EXTERN ares_status_t ares_set_socket_functions_ex(
 /*! Opaque retained identity for a cancellable logical operation. */
 typedef struct ares_operation ares_operation_t;
 
+/*! Submit a cancellable address lookup, including every family and search.
+ *  \param[in] channel Live channel.
+ *  \param[in] node Host name or numeric address, or NULL for service only.
+ *  \param[in] service Service name or port, or NULL.
+ *  \param[in] hints Address lookup hints, or NULL.
+ *  \param[in] callback Exactly one terminal callback after acceptance.
+ *  \param[in] arg Callback argument.
+ *  \param[out] operation Receives one reference before callback eligibility.
+ *  \return ARES_SUCCESS on acceptance; otherwise no callback or token.
+ */
+CARES_EXTERN ares_status_t ares_getaddrinfo_cancellable(
+  ares_channel_t *channel, const char *node, const char *service,
+  const struct ares_addrinfo_hints *hints, ares_addrinfo_callback callback,
+  void *arg, ares_operation_t **operation);
+
+/*! Submit a cancellable logical DNS search. See ares_operation(3).
+ *  \param[in] channel Live channel.
+ *  \param[in] dnsrec Single-question DNS record to search.
+ *  \param[in] callback Exactly one terminal callback after acceptance.
+ *  \param[in] arg Callback argument.
+ *  \param[out] operation Receives one reference before callback eligibility.
+ *  \return ARES_SUCCESS on acceptance; otherwise no callback or token.
+ */
+CARES_EXTERN ares_status_t ares_search_dnsrec_cancellable(
+  ares_channel_t *channel, const ares_dns_record_t *dnsrec,
+  ares_callback_dnsrec callback, void *arg, ares_operation_t **operation);
+
 /*! Cancel an operation. Terminal operations are a successful no-op.
  *  \param[in] channel Live submitting channel for an active operation.
  *  \param[in] operation Retained operation token.

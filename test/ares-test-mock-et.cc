@@ -138,6 +138,124 @@ static void OperationRaceCallback(void *arg, ares_status_t status, size_t,
   result->status = status;
 }
 
+static void CompositeThreadCallback(void *arg, int status, int timeouts,
+                                    ares_addrinfo *ai)
+{
+  ares_freeaddrinfo(ai);
+  OperationThreadCallback(arg, static_cast<ares_status_t>(status),
+                          static_cast<size_t>(timeouts), nullptr);
+}
+
+TEST_P(MockUDPEventThreadTest, CompositeCompletionOwnsCallbackLifetime)
+{
+  DNSPacket reply;
+  reply.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("thread.example", T_A))
+    .add_answer(new DNSARR("thread.example", 100, { 1, 2, 3, 4 }));
+  EXPECT_CALL(server_, OnRequest("thread.example", T_A))
+    .WillOnce(SetReply(&server_, &reply));
+  OperationThreadResult result;
+  ares_operation_t     *operation = nullptr;
+  ares_addrinfo_hints   hints     = {};
+  hints.ai_family                 = AF_INET;
+  ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                            channel_, "thread.example.", nullptr, &hints,
+                            CompositeThreadCallback, &result, &operation));
+  std::thread cancel([&] {
+    std::unique_lock<std::mutex> lock(result.mutex);
+    EXPECT_TRUE(result.condition.wait_for(lock, std::chrono::seconds(5),
+                                          [&] { return result.entered; }));
+    lock.unlock();
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, operation));
+    ares_operation_release(operation);
+    lock.lock();
+    result.released = true;
+    result.condition.notify_all();
+  });
+  Process();
+  cancel.join();
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_EQ(ARES_SUCCESS, result.status);
+}
+
+TEST_P(MockUDPEventThreadTest, CompositeDestroyOwnsCallbackLifetime)
+{
+  OperationThreadResult result;
+  ares_operation_t     *operation = nullptr;
+  ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                            channel_, "pending.example.", nullptr, nullptr,
+                            CompositeThreadCallback, &result, &operation));
+  std::thread cancel([&] {
+    std::unique_lock<std::mutex> lock(result.mutex);
+    EXPECT_TRUE(result.condition.wait_for(lock, std::chrono::seconds(5),
+                                          [&] { return result.entered; }));
+    lock.unlock();
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, operation));
+    ares_operation_release(operation);
+    lock.lock();
+    result.released = true;
+    result.condition.notify_all();
+  });
+  ares_destroy(channel_);
+  channel_ = nullptr;
+  cancel.join();
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_EQ(ARES_EDESTRUCTION, result.status);
+}
+
+TEST_P(MockUDPEventThreadTest, CompositeCancellationRacesFamilyResponses)
+{
+  DNSPacket ipv4, ipv6;
+  ipv4.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("race.example", T_A))
+    .add_answer(new DNSARR("race.example", 100, { 1, 2, 3, 4 }));
+  ipv6.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("race.example", T_AAAA))
+    .add_answer(new DNSAaaaRR(
+      "race.example", 100, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }));
+  std::mutex              mutex;
+  std::condition_variable condition;
+  bool                    ready = false;
+  EXPECT_CALL(server_, OnRequest("race.example", T_A))
+    .WillOnce(testing::Invoke([&](const std::string &, int) {
+      server_.SetReply(&ipv4);
+      std::lock_guard<std::mutex> lock(mutex);
+      ready = true;
+      condition.notify_all();
+    }));
+  ON_CALL(server_, OnRequest("race.example", T_AAAA))
+    .WillByDefault(SetReply(&server_, &ipv6));
+  OperationThreadResult result;
+  ares_operation_t     *operation = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_getaddrinfo_cancellable(
+              channel_, "race.example.", nullptr, nullptr,
+              [](void *arg, int status, int, ares_addrinfo *ai) {
+                ares_freeaddrinfo(ai);
+                OperationRaceCallback(arg, static_cast<ares_status_t>(status),
+                                      0, nullptr);
+              },
+              &result, &operation));
+  std::thread cancel([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(
+      condition.wait_for(lock, std::chrono::seconds(5), [&] { return ready; }));
+    lock.unlock();
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, operation));
+  });
+  Process();
+  cancel.join();
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_TRUE(result.status == ARES_SUCCESS ||
+              result.status == ARES_ECANCELLED);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, operation));
+  EXPECT_EQ(1U, result.calls);
+  ares_operation_release(operation);
+}
+
 TEST_P(MockUDPEventThreadTest, IndividualCancellationRacesResponseDelivery)
 {
   DNSPacket reply;

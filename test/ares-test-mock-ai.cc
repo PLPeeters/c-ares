@@ -49,6 +49,207 @@ MATCHER_P(IncludesNumAddresses, n, "") {
   return n == cnt;
 }
 
+struct CompositeResult {
+  size_t             calls     = 0;
+  int                status    = ARES_SUCCESS;
+  bool               addresses = false;
+  ares_operation_t **token     = nullptr;
+  bool               published = false;
+};
+
+static void CompositeCallback(void *arg, int status, int, ares_addrinfo *ai)
+{
+  CompositeResult *result = static_cast<CompositeResult *>(arg);
+  result->calls++;
+  result->status    = status;
+  result->addresses = ai != nullptr;
+  if (result->token != nullptr) {
+    result->published = *result->token != nullptr;
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, *result->token));
+    ares_operation_retain(*result->token);
+    ares_operation_release(*result->token);
+  }
+  ares_freeaddrinfo(ai);
+}
+
+TEST_P(MockChannelTestAI, CompositeCancellationPreservesUnrelatedLookup)
+{
+  DNSPacket reply;
+  reply.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("other.example", T_A))
+    .add_answer(new DNSARR("other.example", 100, { 1, 2, 3, 4 }));
+  ON_CALL(server_, OnRequest("other.example", T_A))
+    .WillByDefault(SetReply(&server_, &reply));
+  CompositeResult     cancelled, other;
+  ares_operation_t   *first = nullptr, *second = nullptr;
+  ares_addrinfo_hints hints = {};
+  hints.ai_family           = AF_UNSPEC;
+  ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                            channel_, "pending.example.", nullptr, &hints,
+                            CompositeCallback, &cancelled, &first));
+  hints.ai_family = AF_INET;
+  ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                            channel_, "other.example.", nullptr, &hints,
+                            CompositeCallback, &other, &second));
+  EXPECT_EQ(3U, ares_queue_active_queries(channel_));
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, first));
+  EXPECT_EQ(1U, cancelled.calls);
+  EXPECT_EQ(ARES_ECANCELLED, cancelled.status);
+  EXPECT_FALSE(cancelled.addresses);
+  EXPECT_EQ(1U, ares_queue_active_queries(channel_));
+  ares_operation_release(second);
+  Process();
+  EXPECT_EQ(1U, cancelled.calls);
+  EXPECT_EQ(1U, other.calls);
+  EXPECT_EQ(ARES_SUCCESS, other.status);
+  EXPECT_TRUE(other.addresses);
+  ares_operation_release(first);
+}
+
+TEST_P(MockChannelTestAI, CompositeCancellationStopsSingleFamily)
+{
+  for (int family : { AF_INET, AF_INET6 }) {
+    CompositeResult     result;
+    ares_operation_t   *operation = nullptr;
+    ares_addrinfo_hints hints     = {};
+    hints.ai_family               = family;
+    ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                              channel_, "pending.example.", nullptr, &hints,
+                              CompositeCallback, &result, &operation));
+    EXPECT_EQ(1U, ares_queue_active_queries(channel_));
+    EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, operation));
+    EXPECT_EQ(1U, result.calls);
+    EXPECT_EQ(ARES_ECANCELLED, result.status);
+    EXPECT_FALSE(result.addresses);
+    EXPECT_EQ(0U, ares_queue_active_queries(channel_));
+    ares_operation_release(operation);
+  }
+}
+
+TEST_P(MockChannelTestAI, CompositeCancellationAfterSearchAdvance)
+{
+  DNSPacket reply;
+  reply.set_response().set_aa().set_rcode(NXDOMAIN).add_question(
+    new DNSQuestion("pending.first.com", T_A));
+  EXPECT_CALL(server_, OnRequest("pending.first.com", T_A))
+    .WillOnce(SetReply(&server_, &reply));
+  CompositeResult   result;
+  ares_operation_t *operation = nullptr;
+  EXPECT_CALL(server_, OnRequest("pending.second.org", T_A))
+    .WillOnce(InvokeWithoutArgs([&] {
+      EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, operation));
+      EXPECT_EQ(1U, result.calls);
+    }));
+  EXPECT_CALL(server_, OnRequest("pending.third.gov", T_A)).Times(0);
+  ares_addrinfo_hints hints = {};
+  hints.ai_family           = AF_INET;
+  ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                            channel_, "pending", nullptr, &hints,
+                            CompositeCallback, &result, &operation));
+  Process();
+  EXPECT_EQ(1U, result.calls);
+  EXPECT_EQ(ARES_ECANCELLED, result.status);
+  EXPECT_EQ(0U, ares_queue_active_queries(channel_));
+  ares_operation_release(operation);
+}
+
+TEST_P(MockChannelTestAI, CompositeShutdownAndChannelCancellation)
+{
+  CompositeResult   cancelled, shutdown;
+  ares_operation_t *first = nullptr, *second = nullptr;
+  ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                            channel_, "pending.example.", nullptr, nullptr,
+                            CompositeCallback, &cancelled, &first));
+  ares_cancel(channel_);
+  EXPECT_EQ(1U, cancelled.calls);
+  EXPECT_EQ(ARES_ECANCELLED, cancelled.status);
+  EXPECT_EQ(0U, ares_queue_active_queries(channel_));
+  ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                            channel_, "shutdown.example.", nullptr, nullptr,
+                            CompositeCallback, &shutdown, &second));
+  ares_destroy(channel_);
+  channel_ = nullptr;
+  EXPECT_EQ(1U, shutdown.calls);
+  EXPECT_EQ(ARES_EDESTRUCTION, shutdown.status);
+  EXPECT_FALSE(shutdown.addresses);
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, first));
+  EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(nullptr, second));
+  ares_operation_release(first);
+  ares_operation_release(second);
+}
+
+TEST_P(MockChannelTestAI, CompositeAllocationFailures)
+{
+  bool rejected = false, accepted_error = false;
+  for (int fail = 1; fail <= 64; fail++) {
+    CompositeResult   result;
+    ares_operation_t *operation = nullptr;
+    SetAllocFail(fail);
+    ares_status_t status = ares_getaddrinfo_cancellable(
+      channel_, "pending.example.", nullptr, nullptr, CompositeCallback,
+      &result, &operation);
+    ClearFails();
+    if (status != ARES_SUCCESS) {
+      rejected = true;
+      EXPECT_EQ(ARES_ENOMEM, status);
+      EXPECT_EQ(nullptr, operation);
+      EXPECT_EQ(0U, result.calls);
+    } else {
+      if (result.calls != 0) {
+        accepted_error = true;
+        EXPECT_EQ(ARES_ENOMEM, result.status);
+      }
+      EXPECT_EQ(ARES_SUCCESS, ares_operation_cancel(channel_, operation));
+      EXPECT_EQ(1U, result.calls);
+      EXPECT_FALSE(result.addresses);
+      ares_operation_release(operation);
+    }
+    EXPECT_EQ(0U, ares_queue_active_queries(channel_));
+  }
+  EXPECT_TRUE(rejected);
+  EXPECT_TRUE(accepted_error);
+}
+
+TEST_F(DefaultChannelTestAI, CompositeSynchronousResultsPublishTerminalToken)
+{
+  struct Case {
+    const char *name;
+    const char *service;
+    int         family;
+    int         expected;
+  };
+
+  const Case cases[] = {
+    { "127.0.0.1",  nullptr, AF_UNSPEC, ARES_SUCCESS   },
+    { "::1",        nullptr, AF_UNSPEC, ARES_SUCCESS   },
+    { "localhost",  nullptr, AF_UNSPEC, ARES_SUCCESS   },
+    { nullptr,      "80",    AF_UNSPEC, ARES_SUCCESS   },
+    { nullptr,      nullptr, AF_UNSPEC, ARES_ENOTFOUND },
+    { "name.onion", nullptr, AF_UNSPEC, ARES_ENOTFOUND },
+    { "name",       nullptr, -1,        ARES_ENOTIMP   },
+    { "name",       "65536", AF_UNSPEC, ARES_ESERVICE  },
+  };
+  for (const auto &item : cases) {
+    SCOPED_TRACE(item.name ? item.name : "NULL");
+    CompositeResult   result;
+    ares_operation_t *operation = nullptr;
+    result.token                = &operation;
+    ares_addrinfo_hints hints   = {};
+    hints.ai_family             = item.family;
+    hints.ai_flags              = ARES_AI_NUMERICSERV;
+    ASSERT_EQ(ARES_SUCCESS, ares_getaddrinfo_cancellable(
+                              channel_, item.name, item.service, &hints,
+                              CompositeCallback, &result, &operation));
+    EXPECT_TRUE(result.published);
+    EXPECT_EQ(1U, result.calls);
+    EXPECT_EQ(item.expected, result.status);
+    EXPECT_EQ(item.expected == ARES_SUCCESS, result.addresses);
+    EXPECT_EQ(0U, ares_queue_active_queries(channel_));
+    ares_operation_release(operation);
+  }
+}
+
 MATCHER_P(IncludesV4Address, address, "") {
   (void)result_listener;
   if(!arg)

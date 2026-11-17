@@ -1862,6 +1862,11 @@ done:
 
 void ares_detach_query(ares_query_t *query)
 {
+  if (query->operation != NULL) {
+    ares_llist_node_destroy(query->node_operation);
+    query->node_operation = NULL;
+    query->operation      = NULL;
+  }
   ares_conn_discard_query_nolock(query->channel, query->serial);
   /* Remove the query from all the lists in which it is linked */
   ares_query_remove_from_conn(query);

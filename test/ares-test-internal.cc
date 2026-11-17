@@ -78,7 +78,8 @@ void ExhaustOperationSerials(ares_channel_t *channel)
 // public APIs and socket boundary, without exposing a product test hook.
 void ForceOperationWireId(ares_operation_t *operation, unsigned short id)
 {
-  ares_query_t *query = operation->query;
+  ares_query_t *query =
+    static_cast<ares_query_t *>(ares_llist_first_val(operation->queries));
   ASSERT_NE(nullptr, query);
   ares_channel_lock(query->channel);
   ares_buf_t *frame = ares_buf_create();
