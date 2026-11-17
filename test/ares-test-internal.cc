@@ -65,6 +65,41 @@ namespace ares {
 namespace test {
 
 #ifndef CARES_SYMBOL_HIDING
+void ExhaustOperationSerials(ares_channel_t *channel)
+{
+  channel->query_serial = (ares_uint64_t)-2;
+}
+
+// The public API intentionally does not allow choosing a wire ID. Force reuse
+// deterministically while quiescent, keeping the query/hash/serialized tail in
+// agreement. All cancellation and response behavior is exercised through the
+// public APIs and socket boundary, without exposing a product test hook.
+void ForceOperationWireId(ares_operation_t *operation, unsigned short id)
+{
+  ares_query_t *query =
+    static_cast<ares_query_t *>(ares_llist_first_val(operation->queries));
+  ASSERT_NE(nullptr, query);
+  ares_channel_lock(query->channel);
+  ares_buf_t *frame = ares_buf_create();
+  ASSERT_NE(nullptr, frame);
+  ASSERT_FALSE(
+    ares_htable_szvp_get(query->channel->queries_by_qid, id, nullptr));
+  ares_htable_szvp_remove(query->channel->queries_by_qid, query->qid);
+  query->qid = id;
+  ares_dns_record_set_id(query->query, id);
+  ASSERT_TRUE(
+    ares_htable_szvp_insert(query->channel->queries_by_qid, id, query));
+  ASSERT_EQ(ARES_SUCCESS, ares_dns_write_buf_tcp(query->query, frame));
+  size_t               len;
+  const unsigned char *bytes = ares_buf_peek(frame, &len);
+  ares_buf_t          *out   = query->conn->out_buf;
+  ASSERT_GE(ares_buf_len(out), len);
+  ASSERT_EQ(ARES_SUCCESS, ares_buf_remove(out, ares_buf_len(out) - len, len));
+  ASSERT_EQ(ARES_SUCCESS, ares_buf_append(out, bytes, len));
+  ares_buf_destroy(frame);
+  ares_channel_unlock(query->channel);
+}
+
 TEST_F(LibraryTest, StringLength) {
   const char data[] = "test\0test";
   size_t n = sizeof data;
@@ -1953,6 +1988,27 @@ TEST_F(LibraryTest, BufSplitStr) {
   EXPECT_TRUE(ares_streq(strs[2], "string3"));
   EXPECT_TRUE(ares_streq(strs[3], "string4"));
   ares_free_array(strs, nstrs, ares_free);
+}
+
+TEST_F(LibraryTest, BufRemove)
+{
+  ares_buf_t *buf = ares_buf_create();
+  ASSERT_NE(nullptr, buf);
+  ASSERT_EQ(ARES_SUCCESS, ares_buf_append_str(buf, "0123456789"));
+  ASSERT_EQ(ARES_SUCCESS, ares_buf_consume(buf, 2));
+  ares_buf_tag(buf);
+  EXPECT_EQ(ARES_SUCCESS, ares_buf_remove(buf, 2, 3));
+  EXPECT_EQ(ARES_SUCCESS, ares_buf_tag_rollback(buf));
+  EXPECT_EQ(ARES_EFORMERR, ares_buf_remove(buf, 6, 0));
+  EXPECT_EQ(ARES_EFORMERR, ares_buf_remove(buf, 1, static_cast<size_t>(-1)));
+  EXPECT_EQ(ARES_SUCCESS, ares_buf_remove(buf, 5, 0));
+  char *str = ares_buf_finish_str(buf, nullptr);
+  EXPECT_STREQ("23789", str);
+  ares_free(str);
+  buf =
+    ares_buf_create_const(reinterpret_cast<const unsigned char *>("abc"), 3);
+  EXPECT_EQ(ARES_EFORMERR, ares_buf_remove(buf, 0, 1));
+  ares_buf_destroy(buf);
 }
 
 TEST_F(LibraryTest, BufReplace) {

@@ -105,11 +105,10 @@ done:
   return status;
 }
 
-ares_status_t ares_send_nolock(ares_channel_t *channel, ares_server_t *server,
-                               ares_send_flags_t        flags,
-                               const ares_dns_record_t *dnsrec,
-                               ares_callback_dnsrec callback, void *arg,
-                               unsigned short *qid)
+ares_status_t ares_send_operation_nolock(
+  ares_channel_t *channel, ares_server_t *server, ares_send_flags_t flags,
+  const ares_dns_record_t *dnsrec, ares_callback_dnsrec callback, void *arg,
+  unsigned short *qid, ares_operation_t *operation)
 {
   ares_query_t      *query;
   ares_timeval_t     now;
@@ -170,6 +169,14 @@ ares_status_t ares_send_nolock(ares_channel_t *channel, ares_server_t *server,
       ares_dns_record_destroy(dnsrec_resp);
       return status;
     }
+  }
+
+  /* Never recycle an identity while a buffered frame may still own it. The
+   * portable 64-bit counter also avoids an early limit on 32-bit platforms. */
+  if (channel->query_serial == (ares_uint64_t)-1) {
+    ares_free(qcache_key);
+    callback(arg, ARES_ENOMEM, 0, NULL);
+    return ARES_ENOMEM;
   }
 
   /* Allocate space for query and allocated fields. */
@@ -270,6 +277,19 @@ ares_status_t ares_send_nolock(ares_channel_t *channel, ares_server_t *server,
     /* LCOV_EXCL_STOP */
   }
 
+  if (operation != NULL) {
+    query->node_operation = ares_llist_insert_last(operation->queries, query);
+    if (query->node_operation == NULL) {
+      /* LCOV_EXCL_START: OutOfMemory */
+      ares_detach_query(query);
+      callback(arg, ARES_ENOMEM, 0, NULL);
+      ares_free_query(query);
+      return ARES_ENOMEM;
+      /* LCOV_EXCL_STOP */
+    }
+    query->operation = operation;
+  }
+
   /* Perform the first query action. */
 
   /* Sending opens and writes to connections and can mark a server down, both
@@ -287,6 +307,52 @@ ares_status_t ares_send_nolock(ares_channel_t *channel, ares_server_t *server,
     *qid = id;
   }
 
+  return status;
+}
+
+ares_status_t ares_send_nolock(ares_channel_t *channel, ares_server_t *server,
+                               ares_send_flags_t        flags,
+                               const ares_dns_record_t *dnsrec,
+                               ares_callback_dnsrec callback, void *arg,
+                               unsigned short *qid)
+{
+  return ares_send_operation_nolock(channel, server, flags, dnsrec, callback,
+                                    arg, qid, NULL);
+}
+
+ares_status_t ares_send_dnsrec_cancellable(ares_channel_t          *channel,
+                                           const ares_dns_record_t *dnsrec,
+                                           ares_callback_dnsrec     callback,
+                                           void                    *arg,
+                                           ares_operation_t       **operation)
+{
+  ares_operation_t *op;
+  ares_status_t     status = ARES_SUCCESS;
+
+  if (operation != NULL) {
+    *operation = NULL;
+  }
+  if (channel == NULL || dnsrec == NULL || callback == NULL ||
+      operation == NULL) {
+    return ARES_EFORMERR;
+  }
+  ares_channel_lock(channel);
+  if (!channel->sys_up) {
+    status = ARES_EDESTRUCTION;
+    goto done;
+  }
+  op = ares_operation_create_nolock(channel, callback, arg);
+  if (op == NULL) {
+    status = ARES_ENOMEM;
+    goto done;
+  }
+  *operation = op;
+  ares_deferred_cb_enter(channel);
+  ares_send_operation_nolock(channel, NULL, 0, dnsrec, ares_operation_callback,
+                             op, NULL, op);
+  ares_deferred_cb_leave(channel);
+done:
+  ares_channel_unlock(channel);
   return status;
 }
 

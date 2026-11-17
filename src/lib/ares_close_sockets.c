@@ -53,6 +53,7 @@ void ares_conn_reap(ares_conn_t *conn)
 
   ares_buf_destroy(conn->in_buf);
   ares_buf_destroy(conn->out_buf);
+  ares_llist_destroy(conn->out_frames);
   ares_llist_destroy(conn->queries_to_conn);
   ares_free(conn);
 }

@@ -58,11 +58,10 @@ static void ares_query_dnsrec_cb(void *arg, ares_status_t status,
   ares_free(qquery);
 }
 
-ares_status_t ares_query_nolock(ares_channel_t *channel, const char *name,
-                                ares_dns_class_t     dnsclass,
-                                ares_dns_rec_type_t  type,
-                                ares_callback_dnsrec callback, void *arg,
-                                unsigned short *qid)
+ares_status_t ares_query_operation_nolock(
+  ares_channel_t *channel, const char *name, ares_dns_class_t dnsclass,
+  ares_dns_rec_type_t type, ares_callback_dnsrec callback, void *arg,
+  unsigned short *qid, ares_operation_t *operation)
 {
   ares_status_t            status;
   ares_dns_record_t       *dnsrec = NULL;
@@ -105,10 +104,55 @@ ares_status_t ares_query_nolock(ares_channel_t *channel, const char *name,
   qquery->arg      = arg;
 
   /* Send it off.  qcallback will be called when we get an answer. */
-  status = ares_send_nolock(channel, NULL, 0, dnsrec, ares_query_dnsrec_cb,
-                            qquery, qid);
+  status = ares_send_operation_nolock(
+    channel, NULL, 0, dnsrec, ares_query_dnsrec_cb, qquery, qid, operation);
 
   ares_dns_record_destroy(dnsrec);
+  return status;
+}
+
+ares_status_t ares_query_nolock(ares_channel_t *channel, const char *name,
+                                ares_dns_class_t     dnsclass,
+                                ares_dns_rec_type_t  type,
+                                ares_callback_dnsrec callback, void *arg,
+                                unsigned short *qid)
+{
+  return ares_query_operation_nolock(channel, name, dnsclass, type, callback,
+                                     arg, qid, NULL);
+}
+
+ares_status_t ares_query_dnsrec_cancellable(
+  ares_channel_t *channel, const char *name, ares_dns_class_t dnsclass,
+  ares_dns_rec_type_t type, ares_callback_dnsrec callback, void *arg,
+  ares_operation_t **operation)
+{
+  ares_operation_t *op;
+  ares_status_t     status = ARES_SUCCESS;
+
+  if (operation != NULL) {
+    *operation = NULL;
+  }
+  if (channel == NULL || name == NULL || callback == NULL ||
+      operation == NULL) {
+    return ARES_EFORMERR;
+  }
+  ares_channel_lock(channel);
+  if (!channel->sys_up) {
+    status = ARES_EDESTRUCTION;
+    goto done;
+  }
+  op = ares_operation_create_nolock(channel, callback, arg);
+  if (op == NULL) {
+    status = ARES_ENOMEM;
+    goto done;
+  }
+  *operation = op;
+  ares_deferred_cb_enter(channel);
+  ares_query_operation_nolock(channel, name, dnsclass, type,
+                              ares_operation_callback, op, NULL, op);
+  ares_deferred_cb_leave(channel);
+done:
+  ares_channel_unlock(channel);
   return status;
 }
 

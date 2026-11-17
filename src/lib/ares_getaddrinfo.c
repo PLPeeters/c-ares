@@ -84,6 +84,11 @@ struct host_query {
 
   /* Track nodata responses to possibly override final result */
   size_t                nodata_cnt;
+  ares_operation_t     *operation;
+  size_t                refs;
+  size_t                unsubmitted;
+  ares_status_t         stop_status;
+  ares_bool_t           completed;
 };
 
 static const struct ares_addrinfo_hints default_hints = {
@@ -325,21 +330,30 @@ static ares_bool_t fake_addrinfo(const char *name, unsigned short port,
   return ARES_TRUE;
 }
 
-static void hquery_free(struct host_query *hquery, ares_bool_t cleanup_ai)
+static void hquery_free(struct host_query *hquery)
 {
-  if (cleanup_ai) {
-    ares_freeaddrinfo(hquery->ai);
-  }
+  ares_freeaddrinfo(hquery->ai);
   ares_strsplit_free(hquery->names, hquery->names_cnt);
   ares_free(hquery->name);
   ares_free(hquery->lookups);
   ares_free(hquery);
 }
 
+static void hquery_release(struct host_query *hquery)
+{
+  hquery->refs--;
+  if (hquery->refs == 0) {
+    hquery_free(hquery);
+  }
+}
+
 static void end_hquery(struct host_query *hquery, ares_status_t status)
 {
   struct ares_addrinfo_node  sentinel;
   struct ares_addrinfo_node *next;
+  struct ares_addrinfo      *ai;
+
+  hquery->completed = ARES_TRUE;
 
   if (status == ARES_SUCCESS) {
     if (!(hquery->hints.ai_flags & ARES_AI_NOSORT) && hquery->ai->nodes) {
@@ -360,8 +374,33 @@ static void end_hquery(struct host_query *hquery, ares_status_t status)
     hquery->ai = NULL;
   }
 
-  hquery->callback(hquery->arg, (int)status, (int)hquery->timeouts, hquery->ai);
-  hquery_free(hquery, ARES_FALSE);
+  ai         = hquery->ai;
+  hquery->ai = NULL;
+  hquery->callback(hquery->arg, (int)status, (int)hquery->timeouts, ai);
+  hquery_release(hquery);
+}
+
+static void stop_hquery(void *arg, ares_status_t status)
+{
+  struct host_query *hquery = arg;
+  if (hquery->stop_status != ARES_SUCCESS) {
+    return;
+  }
+  /* Hold the parent through the last child's callback and the drain loop.
+   * Reserved sibling submissions are not native work and must not delay the
+   * terminal callback or be launched after cancellation returns. */
+  hquery->refs++;
+  hquery->stop_status  = status;
+  hquery->remaining   -= hquery->unsubmitted;
+  hquery->unsubmitted  = 0;
+  if (hquery->operation != NULL) {
+    ares_operation_set_terminal_nolock(hquery->operation);
+    ares_operation_drain_nolock(hquery->operation, status);
+  }
+  if (hquery->remaining == 0 && !hquery->completed) {
+    end_hquery(hquery, status);
+  }
+  hquery_release(hquery);
 }
 
 ares_bool_t ares_is_localhost(const char *name)
@@ -479,8 +518,9 @@ static void terminate_retries(const struct host_query *hquery,
   const ares_channel_t *channel = hquery->channel;
   ares_query_t         *query   = NULL;
 
-  /* No other outstanding queries, nothing to do */
-  if (!hquery->remaining) {
+  /* A synchronous first-family response can arrive before its sibling has
+   * been submitted. Its still-unset qid must not select unrelated work. */
+  if (!hquery->remaining || hquery->unsubmitted != 0) {
     return;
   }
 
@@ -510,7 +550,21 @@ static void host_callback(void *arg, ares_status_t status, size_t timeouts,
   struct host_query *hquery         = (struct host_query *)arg;
   ares_status_t      addinfostatus  = ARES_SUCCESS;
   hquery->timeouts                 += timeouts;
+  hquery->refs++;
   hquery->remaining--;
+
+  if (status == ARES_ECANCELLED || status == ARES_EDESTRUCTION) {
+    stop_hquery(hquery, status);
+  }
+  if (hquery->completed) {
+    goto done;
+  }
+  if (hquery->stop_status != ARES_SUCCESS) {
+    if (hquery->remaining == 0) {
+      end_hquery(hquery, hquery->stop_status);
+    }
+    goto done;
+  }
 
   if (status == ARES_SUCCESS) {
     if (dnsrec == NULL) {
@@ -545,12 +599,7 @@ static void host_callback(void *arg, ares_status_t status, size_t timeouts,
   }
 
   if (!hquery->remaining) {
-    if (status == ARES_EDESTRUCTION || status == ARES_ECANCELLED) {
-      /* must make sure we don't do next_lookup() on destroy or cancel,
-       * and return the appropriate status.  We won't return a partial
-       * result in this case. */
-      end_hquery(hquery, status);
-    } else if (addinfostatus != ARES_SUCCESS && addinfostatus != ARES_ENODATA) {
+    if (addinfostatus != ARES_SUCCESS && addinfostatus != ARES_ENODATA) {
       /* error in parsing result e.g. no memory */
       if (addinfostatus == ARES_EBADRESP && hquery->ai->nodes) {
         /* We got a bad response from server, but at least one query
@@ -580,6 +629,8 @@ static void host_callback(void *arg, ares_status_t status, size_t timeouts,
   }
 
   /* at this point we keep on waiting for the next query to finish */
+done:
+  hquery_release(hquery);
 }
 
 /* Per POSIX getaddrinfo(), when no node/hostname is provided the returned
@@ -636,7 +687,8 @@ static ares_status_t
 static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
                                  const char                       *service,
                                  const struct ares_addrinfo_hints *hints,
-                                 ares_addrinfo_callback callback, void *arg)
+                                 ares_addrinfo_callback callback, void *arg,
+                                 ares_operation_t *operation)
 {
   struct host_query    *hquery;
   unsigned short        port = 0;
@@ -718,6 +770,7 @@ static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
   }
 
   hquery->port        = port;
+  hquery->refs        = 1;
   hquery->channel     = channel;
   hquery->hints       = *hints;
   hquery->sent_family = -1; /* nothing is sent yet */
@@ -726,7 +779,7 @@ static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
   hquery->ai          = ai;
   hquery->name        = ares_strdup(name);
   if (hquery->name == NULL) {
-    hquery_free(hquery, ARES_TRUE);
+    hquery_free(hquery);
     callback(arg, ARES_ENOMEM, 0, NULL);
     return;
   }
@@ -734,7 +787,7 @@ static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
   status =
     ares_search_name_list(channel, name, &hquery->names, &hquery->names_cnt);
   if (status != ARES_SUCCESS) {
-    hquery_free(hquery, ARES_TRUE);
+    hquery_free(hquery);
     callback(arg, (int)status, 0, NULL);
     return;
   }
@@ -743,11 +796,16 @@ static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
 
   hquery->lookups = ares_strdup(channel->lookups);
   if (hquery->lookups == NULL) {
-    hquery_free(hquery, ARES_TRUE);
+    hquery_free(hquery);
     callback(arg, ARES_ENOMEM, 0, NULL);
     return;
   }
   hquery->remaining_lookups = hquery->lookups;
+  hquery->operation         = operation;
+  if (operation != NULL) {
+    operation->cancel_callback = stop_hquery;
+    operation->cancel_arg      = hquery;
+  }
 
   /* Start performing lookups according to channel->lookups. */
   next_lookup(hquery, ARES_ECONNREFUSED /* initial error code */);
@@ -766,9 +824,62 @@ void ares_getaddrinfo(ares_channel_t *channel, const char *name,
    * has unwound, not from inside the internals it runs.  See
    * ares_deferred_cb_enter(). */
   ares_deferred_cb_enter(channel);
-  ares_getaddrinfo_int(channel, name, service, hints, callback, arg);
+  ares_getaddrinfo_int(channel, name, service, hints, callback, arg, NULL);
   ares_deferred_cb_leave(channel);
   ares_channel_unlock(channel);
+}
+
+static void operation_addrinfo_callback(void *arg, int status, int timeouts,
+                                        struct ares_addrinfo *ai)
+{
+  ares_operation_t      *operation = arg;
+  ares_addrinfo_callback callback;
+  void                  *callback_arg;
+  ares_thread_mutex_lock(operation->lock);
+  operation->terminal          = ARES_TRUE;
+  callback                     = operation->addrinfo_callback;
+  callback_arg                 = operation->arg;
+  operation->addrinfo_callback = NULL;
+  operation->arg               = NULL;
+  operation->cancel_callback   = NULL;
+  operation->cancel_arg        = NULL;
+  ares_thread_mutex_unlock(operation->lock);
+  callback(callback_arg, status, timeouts, ai);
+  ares_operation_release(operation);
+}
+
+ares_status_t ares_getaddrinfo_cancellable(
+  ares_channel_t *channel, const char *node, const char *service,
+  const struct ares_addrinfo_hints *hints, ares_addrinfo_callback callback,
+  void *arg, ares_operation_t **operation)
+{
+  ares_operation_t *op;
+  ares_status_t     status = ARES_SUCCESS;
+  if (operation != NULL) {
+    *operation = NULL;
+  }
+  if (channel == NULL || callback == NULL || operation == NULL) {
+    return ARES_EFORMERR;
+  }
+  ares_channel_lock(channel);
+  if (!channel->sys_up) {
+    status = ARES_EDESTRUCTION;
+    goto done;
+  }
+  op = ares_operation_create_nolock(channel, NULL, arg);
+  if (op == NULL) {
+    status = ARES_ENOMEM;
+    goto done;
+  }
+  op->addrinfo_callback = callback;
+  *operation            = op;
+  ares_deferred_cb_enter(channel);
+  ares_getaddrinfo_int(channel, node, service, hints,
+                       operation_addrinfo_callback, op, op);
+  ares_deferred_cb_leave(channel);
+done:
+  ares_channel_unlock(channel);
+  return status;
 }
 
 static ares_bool_t next_dns_lookup(struct host_query *hquery)
@@ -781,31 +892,39 @@ static ares_bool_t next_dns_lookup(struct host_query *hquery)
 
   name = hquery->names[hquery->next_name_idx++];
 
-  /* NOTE: hquery may be invalidated during the call to ares_query_qid(),
-   *       so should not be referenced after this point */
+  /* Child submission may complete synchronously or reenter cancellation.
+   * Keep this frame's parent alive independently of the active lookup. */
+  hquery->refs++;
+  hquery->unsubmitted  = hquery->hints.ai_family == AF_UNSPEC ? 2 : 1;
+  hquery->remaining   += hquery->unsubmitted;
+  hquery->unsubmitted--;
   switch (hquery->hints.ai_family) {
     case AF_INET:
-      hquery->remaining += 1;
-      ares_query_nolock(hquery->channel, name, ARES_CLASS_IN, ARES_REC_TYPE_A,
-                        host_callback, hquery, &hquery->qid_a);
+      ares_query_operation_nolock(hquery->channel, name, ARES_CLASS_IN,
+                                  ARES_REC_TYPE_A, host_callback, hquery,
+                                  &hquery->qid_a, hquery->operation);
       break;
     case AF_INET6:
-      hquery->remaining += 1;
-      ares_query_nolock(hquery->channel, name, ARES_CLASS_IN,
-                        ARES_REC_TYPE_AAAA, host_callback, hquery,
-                        &hquery->qid_aaaa);
+      ares_query_operation_nolock(hquery->channel, name, ARES_CLASS_IN,
+                                  ARES_REC_TYPE_AAAA, host_callback, hquery,
+                                  &hquery->qid_aaaa, hquery->operation);
       break;
     case AF_UNSPEC:
-      hquery->remaining += 2;
-      ares_query_nolock(hquery->channel, name, ARES_CLASS_IN, ARES_REC_TYPE_A,
-                        host_callback, hquery, &hquery->qid_a);
-      ares_query_nolock(hquery->channel, name, ARES_CLASS_IN,
-                        ARES_REC_TYPE_AAAA, host_callback, hquery,
-                        &hquery->qid_aaaa);
+      ares_query_operation_nolock(hquery->channel, name, ARES_CLASS_IN,
+                                  ARES_REC_TYPE_A, host_callback, hquery,
+                                  &hquery->qid_a, hquery->operation);
+      if (hquery->completed || hquery->stop_status != ARES_SUCCESS) {
+        break;
+      }
+      hquery->unsubmitted--;
+      ares_query_operation_nolock(hquery->channel, name, ARES_CLASS_IN,
+                                  ARES_REC_TYPE_AAAA, host_callback, hquery,
+                                  &hquery->qid_aaaa, hquery->operation);
       break;
     default:
       break;
   }
 
+  hquery_release(hquery);
   return ARES_TRUE;
 }

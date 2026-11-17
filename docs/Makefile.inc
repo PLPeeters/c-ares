@@ -87,6 +87,7 @@ MANPAGES = ares_cancel.3		\
   ares_get_servers.3			\
   ares_get_servers_csv.3		\
   ares_get_servers_ports.3		\
+  ares_getaddrinfo_cancellable.3		\
   ares_getaddrinfo.3			\
   ares_gethostbyaddr.3			\
   ares_gethostbyname.3			\
@@ -118,6 +119,13 @@ MANPAGES = ares_cancel.3		\
   ares_process_fd.3			\
   ares_process_fds.3			\
   ares_process_pending_write.3		\
+  ares_operation.3		\
+  ares_operation_t.3		\
+  ares_operation_cancel.3		\
+  ares_operation_retain.3		\
+  ares_operation_release.3		\
+  ares_query_dnsrec_cancellable.3		\
+  ares_send_dnsrec_cancellable.3		\
   ares_query.3				\
   ares_query_dnsrec.3			\
   ares_queue.3				\
@@ -126,6 +134,7 @@ MANPAGES = ares_cancel.3		\
   ares_reinit.3				\
   ares_save_options.3			\
   ares_search.3				\
+  ares_search_dnsrec_cancellable.3		\
   ares_search_dnsrec.3			\
   ares_send.3				\
   ares_send_dnsrec.3			\
